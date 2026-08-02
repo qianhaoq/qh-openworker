@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { detectAgentCommands } from "./agents";
+import { activateAgentProfile, detectAgentCommands } from "./agents";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -34,5 +34,25 @@ describe("detectAgentCommands", () => {
       })),
     );
     await expect(detectAgentCommands(["npx"])).rejects.toThrow("boom");
+  });
+
+  it("calls the activate route with an optional workspace", async () => {
+    vi.stubGlobal("__COWORKER_HTTP__", "http://sidecar.test");
+    const request = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ ok: true, capabilities: { ok: true } }),
+    }));
+    vi.stubGlobal("fetch", request);
+
+    const data = await activateAgentProfile("kimi-main", "/repo");
+    expect(data.ok).toBe(true);
+    const calls = request.mock.calls as unknown as Array<[string, RequestInit]>;
+    expect(new URL(calls[0][0]).pathname).toBe(
+      "/v1/agent-profiles/kimi-main/activate",
+    );
+    expect(JSON.parse(calls[0][1].body as string)).toEqual({
+      workspace: "/repo",
+    });
   });
 });

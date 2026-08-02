@@ -38,7 +38,6 @@ class QhOrchestratorStore:
 
     def __init__(self, path: str | Path) -> None:
         self.store = OrchestrationStore(path)
-        self.store.seed_default_profiles()
 
     def close(self) -> None:
         self.store.close()
@@ -66,12 +65,8 @@ class QhOrchestratorStore:
 
     def get_workspace_main(self, workspace: str | Path) -> AgentProfile:
         profile = self.store.get_workspace_main_profile(workspace)
-        if profile:
-            return profile
-        profile = self.store.get_profile("opencode-main")
         if not profile:
-            raise OrchestrationStoreError("default main profile is missing")
-        self.store.set_workspace_main_profile(workspace, profile.id)
+            raise OrchestrationStoreError("workspace main profile is missing")
         return profile
 
     def set_workspace_main(self, workspace: str | Path, profile_id: str) -> dict[str, str]:
@@ -137,7 +132,7 @@ class QhOrchestratorStore:
                 for member in self._default_mission_members(main_profile_id)
             ]
         plan = MissionPlan.from_dict(plan_data)
-        self._validate_mission_plan(plan, require_executor=True)
+        self._validate_mission_plan(plan, require_executor=False)
 
         requested_target = str(
             body.get("target_profile_id")
@@ -247,7 +242,7 @@ class QhOrchestratorStore:
             }
         )
         plan = MissionPlan.from_dict(merged)
-        self._validate_mission_plan(plan, require_executor=True)
+        self._validate_mission_plan(plan, require_executor=False)
         target_profile_id = self._mission_target_profile(plan, "")
         spec = dict(task.task_spec)
         spec["plan"] = plan.to_dict()
@@ -657,7 +652,7 @@ class QhOrchestratorStore:
             member.role == AgentRole.EXECUTOR for member in plan.members
         ):
             raise OrchestrationStoreError(
-                "confirmed coding missions require an executor profile"
+                "mission confirmation requires an enabled executor Agent profile; add an execution Agent before confirming"
             )
 
     @staticmethod
@@ -681,7 +676,63 @@ class QhOrchestratorStore:
             return executor.profile_id
         if specialists:
             return specialists[0].profile_id
-        raise OrchestrationStoreError("mission plan requires a specialist profile")
+        return ""
+
+    def resolve_profile_for_role(
+        self,
+        role: AgentRole | str,
+        *,
+        explicit_profile_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+    ) -> AgentProfile:
+        role_value = AgentRole(role)
+        explicit = str(explicit_profile_id or "").strip()
+        if explicit:
+            profile = self.store.get_profile(explicit)
+            if not profile or not profile.enabled:
+                raise OrchestrationStoreError(
+                    f"unknown or disabled {role_value.value} Agent profile: {explicit}"
+                )
+            if profile.role != role_value:
+                raise OrchestrationStoreError(
+                    f"{role_value.value} Agent profile has wrong role: {explicit}"
+                )
+            return profile
+
+        task = self.store.get_task(task_id) if task_id else None
+        plan_profile_ids: list[str] = []
+        if task is not None:
+            raw_plan = task.task_spec.get("plan")
+            if isinstance(raw_plan, dict) and raw_plan.get("goal"):
+                plan = MissionPlan.from_dict(raw_plan)
+                plan_profile_ids = [
+                    member.profile_id
+                    for member in plan.members
+                    if member.role == role_value
+                ]
+        if len(plan_profile_ids) == 1:
+            return self.resolve_profile_for_role(
+                role_value, explicit_profile_id=plan_profile_ids[0]
+            )
+        if len(plan_profile_ids) > 1:
+            raise OrchestrationStoreError(
+                f"multiple {role_value.value} Agent profiles are planned; choose one explicitly"
+            )
+
+        candidates = [
+            profile
+            for profile in self.store.list_profiles()
+            if profile.enabled and profile.role == role_value
+        ]
+        if len(candidates) == 1:
+            return candidates[0]
+        if not candidates:
+            raise OrchestrationStoreError(
+                f"add an enabled {role_value.value} Agent profile before continuing"
+            )
+        raise OrchestrationStoreError(
+            f"multiple enabled {role_value.value} Agent profiles exist; choose one explicitly"
+        )
 
     @staticmethod
     def _mission_members_with_runtime(
@@ -749,14 +800,14 @@ class QhOrchestratorStore:
         conversation = str(
             conversation_id or spec.pop("conversation_id", "") or _id("conversation")
         )
-        target = str(
-            target_profile_id
-            or spec.pop("target_profile_id", "")
-            or "opencode-executor"
-        )
-        profile = self.store.get_profile(target)
-        if not profile or not profile.enabled:
-            raise OrchestrationStoreError(f"unknown or disabled target profile: {target}")
+        target = str(target_profile_id or spec.pop("target_profile_id", ""))
+        if target:
+            profile = self.store.get_profile(target)
+            if not profile or not profile.enabled:
+                raise OrchestrationStoreError(f"unknown or disabled target profile: {target}")
+        else:
+            profile = self.resolve_profile_for_role(AgentRole.EXECUTOR)
+            target = profile.id
         if profile.role not in {AgentRole.EXECUTOR, AgentRole.EXPLORER, AgentRole.GUI}:
             raise OrchestrationStoreError("delegated target must be a specialist profile")
         control = dict(spec.get("_orchestration") or {})
@@ -1036,7 +1087,7 @@ class QhOrchestratorStore:
         self,
         task_id: str,
         *,
-        profile_id: str,
+        profile_id: Optional[str] = None,
         role: str,
         agent_session_id: Optional[str] = None,
         worktree_path: Optional[str] = None,
@@ -1052,6 +1103,14 @@ class QhOrchestratorStore:
             raise OrchestrationStoreError(
                 "mission attempts cannot start before plan confirmation"
             )
+        role_value = AgentRole(role)
+        profile = self.resolve_profile_for_role(
+            role_value,
+            explicit_profile_id=profile_id,
+            task_id=task_id,
+        )
+        profile_id = profile.id
+        role = role_value.value
         attempt = self.store.create_attempt(
             task_id=task_id,
             agent_profile_id=profile_id,
@@ -1256,6 +1315,11 @@ class QhOrchestratorStore:
             self.set_task_state(task.id, TaskStatus.REVIEWING.value)
         elif task.status != TaskStatus.REVIEWING:
             raise OrchestrationStoreError("review requires task state VERIFYING or REVIEWING")
+        reviewer_profile = self.resolve_profile_for_role(
+            AgentRole.REVIEWER,
+            explicit_profile_id=reviewer_profile_id,
+            task_id=task.id,
+        )
         review_task_id = _id("review_task")
         self.store.append_event(
             LedgerEvent(
@@ -1266,7 +1330,7 @@ class QhOrchestratorStore:
                 payload={
                     "review_task_id": review_task_id,
                     "artifact_id": artifact_id,
-                    "reviewer_profile_id": reviewer_profile_id or "opencode-reviewer",
+                    "reviewer_profile_id": reviewer_profile.id,
                 },
             )
         )
@@ -1297,7 +1361,12 @@ class QhOrchestratorStore:
             if reviewer_attempts:
                 reviewer_attempt_id = reviewer_attempts[-1].id
             else:
-                profile_id = reviewer_profile_id or "opencode-reviewer"
+                reviewer_profile = self.resolve_profile_for_role(
+                    AgentRole.REVIEWER,
+                    explicit_profile_id=reviewer_profile_id,
+                    task_id=task_id,
+                )
+                profile_id = reviewer_profile.id
                 stable_attempt_id = (
                     "attempt_"
                     + uuid.uuid5(

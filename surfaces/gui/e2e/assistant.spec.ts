@@ -16,7 +16,7 @@ const composer = (page: import("@playwright/test").Page) =>
 const panel = (page: import("@playwright/test").Page) => page.getByTestId("session-list-panel");
 
 test("the session list renders pinned-first and filters by search", async ({ page }) => {
-  await page.goto("/");
+  await page.goto("/#/assistant/wp-1");
   // The pinned session sorts first; the weekly-plan rows follow.
   const firstRow = panel(page).locator(".group").first();
   await expect(firstRow).toContainText("Draft the launch note");
@@ -29,7 +29,7 @@ test("the session list renders pinned-first and filters by search", async ({ pag
 });
 
 test("opening a session and sending a message streams the reply", async ({ page }) => {
-  await page.goto("/");
+  await page.goto("/#/assistant/wp-1");
   await panel(page).getByText("Draft the launch note", { exact: true }).click();
   await expect(page).toHaveURL(/#\/assistant\/pinned-cowork-1$/);
   // The chat header shows the session title.
@@ -42,10 +42,40 @@ test("opening a session and sending a message streams the reply", async ({ page 
   await expect(page.getByText(/Echo: hello there/)).toBeVisible();
 });
 
+test("the first short delta is visible within 100ms and grows across frames", async ({ page }) => {
+  await page.goto("/#/assistant/pinned-cowork-1");
+  await page.evaluate(() => {
+    const state = { start: performance.now(), samples: [] as Array<{ at: number; text: string }> };
+    (window as typeof window & { __streamProbe?: typeof state }).__streamProbe = state;
+    new MutationObserver(() => {
+      const text = document.querySelector<HTMLElement>("[data-testid='streaming-answer']")?.innerText ?? "";
+      const samples = state.samples;
+      if (text && samples.at(-1)?.text !== text) samples.push({ at: performance.now(), text });
+    }).observe(document.body, { childList: true, characterData: true, subtree: true });
+  });
+  await composer(page).fill("three frame stream");
+  await page.evaluate(() => {
+    const probe = (window as typeof window & { __streamProbe?: { start: number } }).__streamProbe;
+    if (probe) probe.start = performance.now();
+  });
+  await composer(page).press("Enter");
+  await expect(page.getByText("中文流", { exact: true })).toBeVisible();
+  const result = await page.evaluate(() => {
+    const probe = (window as typeof window & {
+      __streamProbe?: { start: number; samples: Array<{ at: number; text: string }> };
+    }).__streamProbe!;
+    return {
+      firstMs: probe.samples[0].at - probe.start,
+      samples: probe.samples.map((sample) => sample.text),
+    };
+  });
+  expect(result.firstMs).toBeLessThanOrEqual(100);
+  expect(new Set(result.samples).size).toBeGreaterThanOrEqual(3);
+});
+
 test("the new-session idle state sends a suggestion", async ({ page }) => {
-  await page.goto("/");
-  // The home's 开始新会话 button (the session panel has a 新会话 one too — take the last).
-  await page.getByRole("button", { name: "新会话" }).last().click();
+  await page.goto("/#/assistant/wp-1");
+  await panel(page).getByRole("button", { name: "新会话" }).click();
   await expect(page).toHaveURL(/#\/assistant\/.+/);
   await expect(page.getByRole("heading", { name: "有什么想让我帮忙的？" })).toBeVisible();
 
@@ -78,8 +108,7 @@ test("a new embedded session with no model key does not open a session socket", 
       }),
   );
 
-  await page.goto("/");
-  await page.getByRole("button", { name: "新会话" }).last().click();
+  await page.goto("/#/assistant/no-model-session");
   await expect(page.getByTestId("new-session-runtime-gate")).toContainText("配置模型");
   await page.waitForTimeout(300);
   expect(sessionSocketUrls(page).filter((url) => url.includes("/ws/session/"))).toHaveLength(0);
@@ -122,8 +151,7 @@ test("a new ACP session waits for a usable workspace main profile", async ({ pag
       }),
   );
 
-  await page.goto("/");
-  await page.getByRole("button", { name: "新会话" }).last().click();
+  await page.goto("/#/assistant/no-main-session");
   await page.getByRole("button", { name: "qh-agent" }).click();
   await expect(page.getByTestId("new-session-runtime-gate")).toContainText(
     "尚未配置可用的 main ACP Agent",
@@ -205,7 +233,7 @@ test("the header agent picker binds an ACP profile to the session socket", async
 });
 
 test("a session can be renamed from the row menu", async ({ page }) => {
-  await page.goto("/");
+  await page.goto("/#/assistant/pinned-cowork-1");
   const row = panel(page).locator(".group", { hasText: "Weekly plan 1" });
   await row.hover();
   await row.getByTestId("session-row-menu-button").click();
@@ -236,7 +264,8 @@ test("deleting the open session returns to the assistant home", async ({ page })
   await menu.getByRole("button", { name: "确认删除" }).click();
 
   await expect(page).toHaveURL(/#\/assistant$/);
-  // Gone from the list AND from the home's recent rows once the refetch lands.
-  await expect(panel(page).getByText("Weekly plan 1", { exact: true })).toBeHidden();
+  // The compatibility hash renders the Mission-first home; the deleted session is also
+  // absent from its recent rows once the refetch lands.
+  await expect(page.getByTestId("home-greeting")).toBeVisible();
   await expect(page.getByTestId("home").getByText("Weekly plan 1", { exact: true })).toBeHidden();
 });

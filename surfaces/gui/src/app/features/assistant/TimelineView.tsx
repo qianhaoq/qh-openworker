@@ -48,7 +48,7 @@ export function AssistantAvatar({ agent, live }: { agent: TimelineAgent; live?: 
       title={agentLabel(agent)}
       data-testid="assistant-avatar"
     >
-      {isQ ? <Icon name="brand" size={12} /> : (agent.name || "A").charAt(0).toUpperCase()}
+      {isQ ? <Icon name="brand" size={12} live={live} /> : (agent.name || "A").charAt(0).toUpperCase()}
     </span>
   );
 }
@@ -123,13 +123,14 @@ function BubbleMeta({ text, ts, align }: { text: string; ts?: number; align: "le
 // Reasoning-model thinking text: a quiet disclosure — collapsed by default, the trace one
 // click away. `live` = still streaming (pulsing label).
 export function ThinkingBlock({ text, live }: { text: string; live?: boolean }) {
-  const [open, setOpen] = useState(false);
+  const [userToggle, setUserToggle] = useState<boolean | null>(null);
+  const open = userToggle ?? !!live;
   return (
     <div className="my-1">
       <button
         type="button"
         className="flex items-center gap-1.5 text-[12px] text-faint hover:text-muted"
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => setUserToggle(!open)}
         data-testid="thinking-toggle"
       >
         <Icon
@@ -234,15 +235,16 @@ function LineText({ line }: { line: HumanLine }) {
 }
 
 function StepRow({ tool, approval }: { tool: ToolItem; approval?: ApprovalItem }) {
-  const [raw, setRaw] = useState(false);
   const running = tool.status === "…";
+  const [userToggle, setUserToggle] = useState<boolean | null>(null);
+  const raw = userToggle ?? running;
   const failed = tool.status !== "ok" && !running;
   return (
     <div>
       <button
         type="button"
         className="group flex w-full items-center gap-2 rounded-lg px-2 py-0.5 text-left hover:bg-paper"
-        onClick={() => setRaw((v) => !v)}
+        onClick={() => setUserToggle(!raw)}
         data-testid="turn-step"
       >
         <span
@@ -297,22 +299,17 @@ function StepRow({ tool, approval }: { tool: ToolItem; approval?: ApprovalItem }
 function TurnGroup({
   items,
   live,
-  streamingText,
 }: {
   items: TurnItem[];
   live?: boolean;
-  // Sub-threshold streamed text belongs to THIS group: collapsed → it rides the header as
-  // the live line; expanded → the small quiet line under the steps.
-  streamingText?: string;
 }) {
-  // Turns start COLLAPSED, running or not — the header's live line is the pulse.
   const rows = buildRows(items);
   const tools = items.filter((it): it is ToolItem => it.kind === "tool");
   const running = live || tools.some((t) => t.status === "…");
   const [userToggle, setUserToggle] = useState<boolean | null>(null);
-  const open = userToggle ?? false;
+  const open = userToggle ?? running;
   const lastNarr = [...items].reverse().find((it): it is AssistantItem => it.kind === "assistant");
-  const liveLine = streamingText || lastNarr?.text || "";
+  const liveLine = lastNarr?.text || "";
 
   const nSteps = rows.filter((r) => r.type !== "narr").length;
   const declined = items.filter((it) => it.kind === "approval" && it.resolved === "deny").length;
@@ -363,12 +360,6 @@ function TurnGroup({
             ) : (
               <StepRow tool={row.tool} approval={row.approval} key={i} />
             ),
-          )}
-          {streamingText && (
-            <div className="max-w-[60ch] px-2 py-1 text-[13px] text-muted" data-testid="turn-live-stream">
-              <Markdown text={streamingText} />
-              <span className="stream-cursor" />
-            </div>
           )}
         </div>
       )}
@@ -462,13 +453,12 @@ export function Timeline({
   });
   flush(!!running);
 
-  const lastTurnIndex = blocks.reduce((acc, b, i) => ("turn" in b ? i : acc), -1);
   const mode = streamMode(streaming, items, running);
   const showWaiting =
     running &&
     !compacting &&
     !reasoning &&
-    (!streaming || mode === "hold") &&
+    !streaming &&
     !lastItemIsAssistant(items);
 
   return (
@@ -479,7 +469,6 @@ export function Timeline({
             <TurnGroup
               items={block.turn}
               live={block.live}
-              streamingText={block.live && bi === lastTurnIndex && mode === "quiet" ? streaming : undefined}
               key={bi}
             />
           );
@@ -598,7 +587,7 @@ export function Timeline({
 
       {/* Live thinking (reasoning models): streams for anyone who expands it; folds into
           the answer's disclosure when the message finalizes. */}
-      {running && reasoning && !streaming && <ThinkingBlock text={reasoning} live />}
+      {running && reasoning && <ThinkingBlock text={reasoning} live />}
 
       {/* Compaction runs between provider turns (nothing streams during it). */}
       {running && compacting && <WaitingRow label="正在压缩上下文…" agent={agent} />}
@@ -608,7 +597,7 @@ export function Timeline({
       {!!streaming && mode === "answer" && (
         <div className="flex items-start gap-2.5">
           <AssistantAvatar agent={agent} live />
-          <div className="min-w-0 flex-1">
+          <div className="min-w-0 flex-1" data-testid="streaming-answer" aria-live="polite">
             <div
               className={`mb-1 text-[11px] tracking-[0.06em] text-faint ${
                 agent.kind === "q" ? "uppercase" : ""

@@ -280,6 +280,25 @@ export interface AgentMainProfile {
   profile: AgentProfile;
 }
 
+export type ReadinessNextAction =
+  | "choose_workspace"
+  | "select_main_agent"
+  | "activate_main_agent"
+  | "fix_main_agent"
+  | "create_mission";
+
+export type ReadinessMainAgent = "missing" | "unverified" | "unavailable" | "ready";
+
+export interface Readiness {
+  model_ready: boolean;
+  workspace: string;
+  workspace_valid: boolean;
+  main_agent: ReadinessMainAgent;
+  main_profile: AgentProfile | null;
+  can_create_mission: boolean;
+  next_action: ReadinessNextAction;
+}
+
 export interface AgentPermissionOption {
   optionId?: string;
   option_id?: string;

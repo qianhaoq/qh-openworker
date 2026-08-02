@@ -167,7 +167,7 @@ from ..state_migration import (
     migration_report,
     migration_status,
 )
-from .manager import SessionManager
+from .manager import MissionGateError, SessionManager
 
 
 _MIGRATION_READ_PATHS = {
@@ -1551,6 +1551,16 @@ def create_app(
         )
 
     # -- QH ACP / multi-agent control plane ------------------------------------
+    def _mission_gate_detail(exc: MissionGateError) -> dict[str, Any]:
+        detail = {"code": exc.code, "message": exc.message}
+        if exc.code == "WORKSPACE_REQUIRED":
+            detail["legacy_code"] = "MISSION_WORKSPACE_REQUIRED"
+        return detail
+
+    @app.get("/v1/readiness")
+    def readiness(workspace: Optional[str] = None) -> dict[str, Any]:
+        return manager.readiness(workspace)
+
     @app.get("/v1/agent-profiles")
     def agent_profiles_list() -> dict[str, Any]:
         return manager.list_agent_profiles()
@@ -1617,6 +1627,26 @@ def create_app(
         except (OSError, RuntimeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.post("/v1/agent-profiles/{profile_id}/activate")
+    async def agent_profiles_activate(
+        profile_id: str, body: Optional[dict] = None
+    ) -> dict[str, Any]:
+        try:
+            return await manager.activate_agent_profile(
+                profile_id, (body or {}).get("workspace")
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=profile_id) from exc
+        except (OSError, RuntimeError, ValueError, OrchestrationStoreError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "AGENT_PROFILE_ACTIVATE_FAILED",
+                    "message": str(exc),
+                    "profile_id": profile_id,
+                },
+            ) from exc
+
     @app.get("/v1/agent-permissions")
     def agent_permissions_list(pending_only: bool = True) -> dict[str, Any]:
         return manager.list_agent_permissions(pending_only=pending_only)
@@ -1637,17 +1667,10 @@ def create_app(
     @app.post("/v1/missions")
     async def missions_create(body: dict) -> dict[str, Any]:
         payload = body or {}
-        spec = payload.get("task_spec") if isinstance(payload.get("task_spec"), dict) else {}
-        if not (payload.get("workspace") or spec.get("workspace")):
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "code": "MISSION_WORKSPACE_REQUIRED",
-                    "message": "Mission creation requires a workspace.",
-                },
-            )
         try:
             return await manager.create_mission_with_main_planning(payload)
+        except MissionGateError as exc:
+            raise HTTPException(status_code=422, detail=_mission_gate_detail(exc)) from exc
         except (KeyError, ValueError, OrchestrationStoreError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1701,22 +1724,21 @@ def create_app(
                 )
                 await ws.close(code=1008)
                 return
-            spec = payload.get("task_spec") if isinstance(payload.get("task_spec"), dict) else {}
-            if not (payload.get("workspace") or spec.get("workspace")):
-                await emit(
-                    {
-                        "type": "error",
-                        "data": {
-                            "code": "MISSION_WORKSPACE_REQUIRED",
-                            "error": "Mission creation requires a workspace.",
-                        },
-                    }
-                )
-                await ws.close(code=1008)
-                return
             await manager.create_mission_with_main_planning(payload, update_sink=emit)
         except WebSocketDisconnect:
             stream_open = False
+        except MissionGateError as exc:
+            detail = _mission_gate_detail(exc)
+            await emit(
+                {
+                    "type": "error",
+                    "data": {
+                        "code": detail["code"],
+                        "legacy_code": detail.get("legacy_code"),
+                        "error": detail["message"],
+                    },
+                }
+            )
         except (KeyError, ValueError, OrchestrationStoreError) as exc:
             await emit(
                 {

@@ -112,6 +112,14 @@ _SCOPES = {s.value for s in Scope}
 
 logger = logging.getLogger("coworker.manager")
 
+
+class MissionGateError(ValueError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 MissionPlanningSink = Callable[[dict[str, Any]], Awaitable[None] | None]
 
 
@@ -1888,6 +1896,53 @@ class SessionManager:
         saved = self.agent_profiles.save_capabilities(profile.id, capabilities)
         return {"ok": True, "profile": saved.to_dict(), "capabilities": capabilities}
 
+    async def activate_agent_profile(
+        self, profile_id: str, workspace: str | Path | None = None
+    ) -> dict[str, Any]:
+        profile = self.agent_profiles.get(profile_id)
+        if profile is None:
+            raise KeyError(profile_id)
+        cwd = str(
+            Path(workspace or self.default_workspace or os.getcwd())
+            .expanduser()
+            .resolve()
+        )
+        profile.enabled = False
+        profile.capabilities = {}
+        profile.capability_probe_fingerprint = None
+        profile = self.agent_profiles.put(profile)
+        probe_identity_fingerprint = profile.identity_fingerprint()
+        adapter = self._agent_adapter(profile)
+        if profile.transport == Transport.ACP_STDIO:
+            capabilities = await adapter.probe(profile, cwd=cwd)
+        else:
+            handle = await adapter.open_session(profile, cwd=cwd)
+            try:
+                capabilities = {
+                    "transport": "jsonl_rpc",
+                    "state": await adapter.get_state(handle),
+                }
+            finally:
+                await adapter.close(handle)
+        current = self.agent_profiles.get(profile.id)
+        if current is None:
+            raise OrchestrationStoreError(
+                "agent profile changed during activation; retry activation for the updated profile"
+            )
+        if current.identity_fingerprint() != probe_identity_fingerprint:
+            current.enabled = False
+            current.capabilities = {}
+            current.capability_probe_fingerprint = None
+            self.agent_profiles.put(current)
+            raise OrchestrationStoreError(
+                "agent profile changed during activation; retry activation for the updated profile"
+            )
+        current.capabilities = dict(capabilities)
+        current.capability_probe_fingerprint = probe_identity_fingerprint
+        current.enabled = True
+        saved = self.agent_profiles.put(current)
+        return {"ok": True, "profile": saved.to_dict(), "capabilities": capabilities}
+
     async def _resolve_agent_permission(
         self, request: PermissionRequest
     ) -> Optional[str]:
@@ -2010,14 +2065,13 @@ class SessionManager:
         body = dict(payload or {})
         spec = body.get("task_spec") if isinstance(body.get("task_spec"), dict) else {}
         workspace = body.get("workspace") or spec.get("workspace")
-        if not workspace:
-            raise ValueError("mission workspace is required")
-        main_profile_id: Optional[str] = None
-        main_profile_id = self._usable_main_profile(workspace).id
-        return self.orchestrator.create_mission(
+        main_profile_id = self._require_mission_ready(workspace).id
+        mission = self.orchestrator.create_mission(
             body,
             main_profile_id=main_profile_id,
         )
+        self._mark_onboarded_after_first_mission()
+        return mission
 
     async def create_mission_with_main_planning(
         self,
@@ -2036,23 +2090,20 @@ class SessionManager:
         spec = body.get("task_spec") if isinstance(body.get("task_spec"), dict) else {}
         workspace_value = body.get("workspace") or spec.get("workspace")
         if not workspace_value:
-            raise ValueError("mission workspace is required")
+            raise MissionGateError(
+                "WORKSPACE_REQUIRED", "Mission creation requires a workspace."
+            )
         workspace = str(Path(workspace_value).expanduser().resolve())
         planning_mode = str(body.get("planning_mode") or "main_agent").strip()
         if planning_mode not in {"main_agent", "control_plane"}:
             raise ValueError("planning_mode must be main_agent or control_plane")
-        profile_error: Optional[Exception] = None
-        main_profile: Optional[AgentProfile] = None
-        try:
-            main_profile = self._usable_main_profile(workspace)
-        except Exception as exc:
-            profile_error = exc
-        main_profile_id = main_profile.id if main_profile is not None else None
+        main_profile = self._require_mission_ready(workspace)
         draft = self.orchestrator.create_mission(
             {**body, "workspace": workspace},
-            main_profile_id=main_profile_id,
+            main_profile_id=main_profile.id,
             defer_plan_proposal=True,
         )
+        self._mark_onboarded_after_first_mission()
         await _emit_mission_planning(
             update_sink,
             {"type": "mission_created", "data": {"mission": draft}},
@@ -2069,13 +2120,6 @@ class SessionManager:
             return await finish(draft)
         mission_id = str(draft["mission_id"])
         draft_plan = dict(draft.get("plan") or {})
-        if profile_error is not None:
-            return await finish(
-                self.orchestrator.block_mission_planning(
-                    mission_id, self._mission_planning_error(profile_error)
-                )
-            )
-        assert main_profile is not None
         if planning_mode == "control_plane":
             return await finish(
                 self.orchestrator.propose_mission_plan(
@@ -2161,6 +2205,89 @@ class SessionManager:
         if not profile.has_current_capability_probe():
             raise RuntimeError("workspace main ACP profile requires a current capability probe")
         return profile
+
+    def readiness(self, workspace: str | Path | None = None) -> dict[str, Any]:
+        raw_workspace = workspace or self.default_workspace or ""
+        workspace_path = (
+            Path(raw_workspace).expanduser().resolve()
+            if str(raw_workspace).strip()
+            else None
+        )
+        workspace_valid = bool(workspace_path and workspace_path.is_dir())
+        main_agent = "missing"
+        main_profile: Optional[dict[str, Any]] = None
+        if workspace_valid and workspace_path is not None:
+            profile = self.agent_profiles.store.get_workspace_main_profile(workspace_path)
+            if profile is None:
+                main_agent = "missing"
+            else:
+                main_profile = profile.to_dict()
+                if profile.role != AgentRole.MAIN or profile.transport == Transport.EMBEDDED:
+                    main_agent = "unavailable"
+                elif not profile.has_current_capability_probe():
+                    main_agent = "unverified"
+                elif not profile.enabled:
+                    main_agent = "unavailable"
+                else:
+                    main_agent = "ready"
+        can_create = workspace_valid and main_agent == "ready"
+        if not workspace_valid:
+            next_action = "choose_workspace"
+        elif main_agent == "missing":
+            next_action = "select_main_agent"
+        elif main_agent == "unverified":
+            next_action = "activate_main_agent"
+        elif main_agent == "unavailable":
+            next_action = "fix_main_agent"
+        else:
+            next_action = "create_mission"
+        return {
+            "model_ready": self._model_ready(self.model),
+            "workspace": str(workspace_path) if workspace_path is not None else "",
+            "workspace_valid": workspace_valid,
+            "main_agent": main_agent,
+            "main_profile": main_profile,
+            "can_create_mission": can_create,
+            "next_action": next_action,
+        }
+
+    def _require_mission_ready(self, workspace: Any) -> AgentProfile:
+        if not workspace or not str(workspace).strip():
+            raise MissionGateError(
+                "WORKSPACE_REQUIRED", "Mission creation requires a workspace."
+            )
+        path = Path(str(workspace)).expanduser().resolve()
+        if not path.is_dir():
+            raise MissionGateError(
+                "WORKSPACE_REQUIRED", "Mission workspace must be an existing directory."
+            )
+        profile = self.agent_profiles.store.get_workspace_main_profile(path)
+        if profile is None:
+            raise MissionGateError(
+                "MAIN_AGENT_MISSING", "Mission creation requires a workspace main Agent."
+            )
+        if profile.role != AgentRole.MAIN or profile.transport == Transport.EMBEDDED:
+            raise MissionGateError(
+                "MAIN_AGENT_UNAVAILABLE",
+                "The workspace main Agent profile is not an ACP runtime.",
+            )
+        if not profile.has_current_capability_probe():
+            raise MissionGateError(
+                "MAIN_AGENT_UNVERIFIED",
+                "The workspace main Agent profile must be activated first.",
+            )
+        if not profile.enabled:
+            raise MissionGateError(
+                "MAIN_AGENT_UNAVAILABLE",
+                "The workspace main Agent profile is disabled.",
+            )
+        return profile
+
+    def _mark_onboarded_after_first_mission(self) -> None:
+        if self._prefs.get("onboarded"):
+            return
+        self._prefs["onboarded"] = True
+        self._save_prefs()
 
     @staticmethod
     def _mission_planning_error(exc: Exception) -> dict[str, Any]:
@@ -2489,9 +2616,10 @@ class SessionManager:
 
     def start_agent_attempt(self, task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         body = payload or {}
+        profile_id = body.get("profile_id")
         return self.orchestrator.start_attempt(
             task_id,
-            profile_id=str(body.get("profile_id") or "opencode-executor"),
+            profile_id=str(profile_id).strip() if profile_id else None,
             role=str(body.get("role") or "executor"),
             agent_session_id=body.get("agent_session_id"),
             worktree_path=body.get("worktree_path"),
@@ -3087,10 +3215,13 @@ class SessionManager:
     ) -> tuple[Any, Any, dict[str, Any], str]:
         task_id = str(task["task_id"])
         spec = task.get("task_spec") or {}
-        profile_id = str(task.get("target_profile_id") or "opencode-executor")
-        profile = self.agent_profiles.get(profile_id)
-        if profile is None or not profile.enabled:
-            raise ValueError(f"invalid target profile: {profile_id}")
+        target_profile_id = str(task.get("target_profile_id") or "")
+        profile = self.orchestrator.resolve_profile_for_role(
+            AgentRole.EXECUTOR,
+            explicit_profile_id=target_profile_id or None,
+            task_id=task_id,
+        )
+        profile_id = profile.id
         role_value = self._profile_role(profile)
         if role_value != "executor":
             raise ValueError("team worker currently requires an executor target profile")
@@ -3722,10 +3853,14 @@ class SessionManager:
             raise RuntimeError(
                 "reviewer prompt outcome is unknown; refusing automatic replay"
             )
-        reviewer_profile = self.agent_profiles.get("opencode-reviewer")
-        if reviewer_profile is None or not reviewer_profile.enabled:
-            raise ValueError("opencode-reviewer profile is missing or disabled")
-        reviewed = self.request_agent_review(execution_artifact["artifact_id"], {})
+        reviewer_profile = self.orchestrator.resolve_profile_for_role(
+            AgentRole.REVIEWER,
+            task_id=task_id,
+        )
+        reviewed = self.request_agent_review(
+            execution_artifact["artifact_id"],
+            {"reviewer_profile_id": reviewer_profile.id},
+        )
         if reviewed.get("state") != "REVIEWING":
             raise RuntimeError("review request did not enter REVIEWING")
         attempt = self.start_agent_attempt(
@@ -3883,7 +4018,6 @@ class SessionManager:
                     continue
 
                 if state in {"IMPLEMENTING", "REWORK"}:
-                    profile = self.agent_profiles.get(str(task.get("target_profile_id") or "opencode-executor"))
                     rework_message = None
                     if state == "REWORK":
                         reviews = task.get("reviews") or []

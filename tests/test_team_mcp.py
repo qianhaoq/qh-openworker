@@ -34,6 +34,33 @@ def _server_params(db_path: Path, *, conversation_id: str = "conv-1", session_id
     )
 
 
+def _install_team_profiles(db_path: Path) -> None:
+    store = QhOrchestratorStore(db_path)
+    for payload in (
+        {
+            "id": "opencode-executor",
+            "role": "executor",
+            "transport": "acp_stdio",
+            "command": "opencode",
+            "args": ["acp"],
+        },
+        {
+            "id": "opencode-reviewer",
+            "role": "reviewer",
+            "transport": "acp_stdio",
+            "command": "opencode",
+            "args": ["acp"],
+            "workspace_policy": "readonly",
+            "permission_policy": "read-only",
+        },
+    ):
+        profile = store.put(payload)
+        profile = store.save_capabilities(profile.id, {"fake": True})
+        profile.enabled = True
+        store.put(profile)
+    store.close()
+
+
 def test_build_team_mcp_server_uses_only_db_and_context_env(tmp_path):
     server = build_team_mcp_server(
         tmp_path / "team.db",
@@ -64,6 +91,7 @@ async def test_team_mcp_stdio_tools_delegate_and_persist(tmp_path):
     from mcp.client.stdio import stdio_client
 
     db_path = tmp_path / "team.db"
+    _install_team_profiles(db_path)
     params = _server_params(db_path)
 
     async with stdio_client(params) as (read_stream, write_stream):
@@ -132,6 +160,7 @@ async def test_review_request_tool_moves_existing_task_into_review(tmp_path):
     from mcp.client.stdio import stdio_client
 
     db_path = tmp_path / "team.db"
+    _install_team_profiles(db_path)
     store = QhOrchestratorStore(db_path)
     task = store.delegate({"prompt": "review me", "title": "Review me"})
     task_id = task["task_id"]

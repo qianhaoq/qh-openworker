@@ -37,6 +37,16 @@ export const probeAgentProfile = (
   error?: string;
 }> => api.post(`/v1/agent-profiles/${encodeURIComponent(profileId)}/probe`, { workspace });
 
+export const activateAgentProfile = (
+  profileId: string,
+  workspace?: string,
+): Promise<{
+  ok: boolean;
+  profile?: AgentProfile;
+  capabilities?: AgentCapabilities;
+  error?: string;
+}> => api.post(`/v1/agent-profiles/${encodeURIComponent(profileId)}/activate`, { workspace });
+
 export const getWorkspaceMainAgent = (workspace?: string): Promise<AgentMainProfile> =>
   api.get<AgentMainProfile>(
     "/v1/agent-profiles/main",

@@ -15,12 +15,16 @@ import type {
   PersonaDetail,
   ProviderInfo,
   Settings,
+  Readiness,
   SurfaceVisibility,
   WebSearchSettings,
 } from "./types";
 
 // -- settings (app.py:1333-1404) ----------------------------------------------------
 export const getSettings = (): Promise<Settings> => api.get<Settings>("/v1/settings");
+
+export const getReadiness = (workspace?: string): Promise<Readiness> =>
+  api.get<Readiness>("/v1/readiness", workspace ? { workspace } : undefined);
 
 export const setModelKey = (
   apiKey: string,

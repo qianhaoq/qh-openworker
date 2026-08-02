@@ -1,11 +1,46 @@
 import pytest
 
-from coworker.orchestration import OrchestrationStoreError, TaskStatus
+from coworker.orchestration import AgentProfile, OrchestrationStoreError, TaskStatus
 from coworker.orchestrator import QhOrchestratorStore
 
 
 def _orchestrator(tmp_path):
-    return QhOrchestratorStore(tmp_path / "orchestration.db")
+    service = QhOrchestratorStore(tmp_path / "orchestration.db")
+    for profile in (
+        AgentProfile(
+            id="opencode-main",
+            role="main",
+            transport="acp_stdio",
+            command="opencode",
+            args=["acp"],
+            model_profile="deepseek-coder",
+            permission_policy="coding-default",
+        ),
+        AgentProfile(
+            id="opencode-executor",
+            role="executor",
+            transport="acp_stdio",
+            command="opencode",
+            args=["acp"],
+            model_profile="deepseek-coder",
+            permission_policy="coding-default",
+        ),
+        AgentProfile(
+            id="opencode-reviewer",
+            role="reviewer",
+            transport="acp_stdio",
+            command="opencode",
+            args=["acp"],
+            model_profile="reviewer",
+            workspace_policy="readonly",
+            permission_policy="read-only",
+        ),
+    ):
+        profile.capabilities = {"agentInfo": {"name": profile.id}}
+        profile.capability_probe_fingerprint = profile.identity_fingerprint()
+        profile.enabled = True
+        service.put(profile)
+    return service
 
 
 def test_profiles_use_one_store_and_workspace_main_is_switchable(tmp_path):
@@ -13,6 +48,7 @@ def test_profiles_use_one_store_and_workspace_main_is_switchable(tmp_path):
     main = service.get("opencode-main")
     main = service.save_capabilities(main.id, {"agentInfo": {"name": "OpenCode"}})
     service.put({**main.to_dict(), "enabled": True})
+    service.set_workspace_main(tmp_path, main.id)
     assert service.get_workspace_main(tmp_path).id == "opencode-main"
     custom = service.put(
         {

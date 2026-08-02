@@ -6,7 +6,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getSessionMessages } from "../../lib/api/sessions";
-import type { ApprovalDecision, Attachment, PermissionMode, SessionUsage } from "../../lib/api/types";
+import type { ApprovalDecision, Attachment, PermissionMode, SessionUsage, WsEvent } from "../../lib/api/types";
 import { SessionSocket } from "../../lib/ws";
 import { resolveAgentChoice, type AgentChoice } from "./agentChoice";
 import {
@@ -17,6 +17,7 @@ import {
   initialChatState,
   itemsFromMessages,
   markConnected,
+  markHistoryStale,
   markUnattended,
   resolveLastApproval,
   resolveLastDirReq,
@@ -26,6 +27,27 @@ import {
   type ChatState,
   type TimelineItem,
 } from "./timeline";
+
+const requestFrame = (cb: () => void): number =>
+  typeof window !== "undefined" && typeof window.requestAnimationFrame === "function"
+    ? window.requestAnimationFrame(cb)
+    : window.setTimeout(cb, 16);
+
+const cancelFrame = (id: number): void => {
+  if (typeof window !== "undefined" && typeof window.cancelAnimationFrame === "function") {
+    window.cancelAnimationFrame(id);
+  } else {
+    window.clearTimeout(id);
+  }
+};
+
+export function reduceWsEventsInOrder(
+  state: ChatState,
+  events: WsEvent[],
+  now: number = Date.now(),
+): ChatState {
+  return events.reduce((next, event) => applyWsEvent(next, event, now), state);
+}
 
 // -- module-level history cache (instant paint when switching back to a session) --------
 
@@ -95,10 +117,30 @@ export function useSessionChat({
 }: UseSessionChatOptions): SessionChat {
   const [state, setState] = useState<ChatState>(initialChatState);
   const socketRef = useRef<SessionSocket | null>(null);
+  const eventQueueRef = useRef<WsEvent[]>([]);
+  const frameRef = useRef<number | null>(null);
   const runningRef = useRef(false);
   const onTurnSettledRef = useRef(onTurnSettled);
   onTurnSettledRef.current = onTurnSettled;
   runningRef.current = state.running;
+
+  const flushQueuedEvents = useCallback(() => {
+    frameRef.current = null;
+    const queued = eventQueueRef.current;
+    if (!queued.length) return;
+    eventQueueRef.current = [];
+    setState((s) => reduceWsEventsInOrder(s, queued));
+  }, []);
+
+  const enqueueEvent = useCallback(
+    (event: WsEvent) => {
+      eventQueueRef.current.push(event);
+      if (event.type === "turn_start") runningRef.current = true;
+      else if (event.type === "turn_done") runningRef.current = false;
+      if (frameRef.current === null) frameRef.current = requestFrame(flushQueuedEvents);
+    },
+    [flushQueuedEvents],
+  );
 
   // -- history: instant paint from cache, then the authoritative re-read ----------------
   useEffect(() => {
@@ -108,6 +150,7 @@ export function useSessionChat({
       connected: s.connected && socketRef.current !== null,
       items: cached?.items ?? [],
       usage: cached?.usage ?? emptyUsage(),
+      historyStale: !!cached,
     }));
     let stale = false;
     getSessionMessages(sessionId)
@@ -121,7 +164,7 @@ export function useSessionChat({
         setState((s) => hydrateChat(s, items, usage));
       })
       .catch(() => {
-        /* offline — the cached/empty view stands; the socket's close handler reports */
+        setState((s) => markHistoryStale(s, !!cached));
       });
     return () => {
       stale = true;
@@ -144,13 +187,18 @@ export function useSessionChat({
     if (!connect) {
       socketRef.current?.close();
       socketRef.current = null;
+      eventQueueRef.current = [];
+      if (frameRef.current !== null) {
+        cancelFrame(frameRef.current);
+        frameRef.current = null;
+      }
       setState((s) => markConnected(s, false));
       return;
     }
     const { runtime, profileId } = resolveAgentChoice(agentChoice);
     const socket = new SessionSocket(sessionId, workspaceRef.current, agent, {
       onEvent: (event) => {
-        setState((s) => applyWsEvent(s, event));
+        enqueueEvent(event);
         if (event.type === "turn_done") onTurnSettledRef.current?.();
       },
       onOpen: () => setState((s) => markConnected(s, true)),
@@ -160,9 +208,14 @@ export function useSessionChat({
     return () => {
       socketRef.current = null;
       socket.close();
+      eventQueueRef.current = [];
+      if (frameRef.current !== null) {
+        cancelFrame(frameRef.current);
+        frameRef.current = null;
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, agent, agentChoice, connect]);
+  }, [sessionId, agent, agentChoice, connect, enqueueEvent]);
 
   const setUnattended = useCallback(
     (on: boolean) => setState((s) => markUnattended(s, on)),

@@ -153,6 +153,19 @@ class FakeMemoryStore:
 
 def _stores(tmp_path):
     orchestrator = QhOrchestratorStore(tmp_path / "orchestration.db")
+    profile = _register_profile(
+        orchestrator,
+        {
+            "id": "test-main",
+            "role": "main",
+            "transport": "acp_stdio",
+            "command": sys.executable,
+            "args": [str(FIXTURE)],
+            "model_profile": "fake-model",
+            "limits": {"timeout_seconds": 5},
+        },
+    )
+    orchestrator.set_workspace_main(tmp_path, profile.id)
     conversations = ConversationStore(tmp_path / "conversations")
     memory = FakeMemoryStore()
     return orchestrator, conversations, memory
@@ -268,6 +281,8 @@ async def test_open_reuses_live_runtime_and_reopens_on_workspace_or_profile_chan
 
     other_workspace = tmp_path / "other-workspace"
     other_workspace.mkdir()
+    main_profile = orchestrator.get_workspace_main(tmp_path)
+    orchestrator.set_workspace_main(other_workspace, main_profile.id)
     await host.open("conv-open", other_workspace)
     assert len(adapter.open_calls) == 2
     assert adapter.closed == ["fake-main-session"]

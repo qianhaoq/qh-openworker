@@ -63,6 +63,72 @@ def _profiles(store: OrchestrationStore):
     return main, executor, reviewer
 
 
+def _legacy_default_profiles_for_test() -> list[AgentProfile]:
+    profiles = [
+        AgentProfile(
+            id="opencode-main",
+            role=AgentRole.MAIN,
+            transport="acp_stdio",
+            command="opencode",
+            args=["acp"],
+            model_profile="deepseek-coder",
+            workspace_policy="worktree",
+            permission_policy="coding-default",
+            limits={"timeout_seconds": 1800, "max_cost": 5},
+        ),
+        AgentProfile(
+            id="opencode-executor",
+            role=AgentRole.EXECUTOR,
+            transport="acp_stdio",
+            command="opencode",
+            args=["acp"],
+            model_profile="deepseek-coder",
+            workspace_policy="worktree",
+            permission_policy="coding-default",
+            limits={"timeout_seconds": 1800, "max_cost": 5},
+        ),
+        AgentProfile(
+            id="opencode-reviewer",
+            role=AgentRole.REVIEWER,
+            transport="acp_stdio",
+            command="opencode",
+            args=["acp"],
+            model_profile="reviewer",
+            workspace_policy="readonly",
+            permission_policy="read-only",
+            limits={"timeout_seconds": 900, "max_cost": 2},
+        ),
+        AgentProfile(
+            id="pi-experimental",
+            role=AgentRole.EXECUTOR,
+            transport="jsonl_rpc",
+            command="pi",
+            args=["--mode", "rpc"],
+            model_profile="experimental",
+            workspace_policy="worktree",
+            permission_policy="coding-default",
+            limits={"timeout_seconds": 1800, "max_cost": 5},
+            enabled=False,
+        ),
+    ]
+    for profile in profiles:
+        if profile.id != "pi-experimental":
+            profile.capabilities = {
+                "preset": {
+                    "id": profile.id,
+                    "source": "qh-openworker-default",
+                }
+            }
+            profile.capability_probe_fingerprint = profile.identity_fingerprint()
+            profile.enabled = True
+    return profiles
+
+
+def _insert_legacy_default_profiles(store: OrchestrationStore) -> None:
+    for profile in _legacy_default_profiles_for_test():
+        store.put_profile(profile)
+
+
 def test_profile_roundtrip_workspace_main_and_session_capabilities(tmp_path):
     store = _store(tmp_path)
     main, _, _ = _profiles(store)
@@ -122,9 +188,127 @@ def test_workspace_main_profile_uses_canonical_path_aliases(tmp_path):
     store.close()
 
 
-def test_seed_default_profiles_preserves_user_configuration_and_capabilities(tmp_path):
-    store = _store(tmp_path)
-    store.seed_default_profiles()
+def test_legacy_default_profiles_are_deleted_on_migration_when_unreferenced(tmp_path):
+    path = tmp_path / "orchestration.db"
+    store = OrchestrationStore(path)
+    _insert_legacy_default_profiles(store)
+    store.close()
+
+    migrated = OrchestrationStore(path)
+    assert migrated.get_profile("opencode-main") is None
+    assert migrated.get_profile("opencode-executor") is None
+    assert migrated.get_profile("opencode-reviewer") is None
+    assert migrated.get_profile("pi-experimental") is None
+    # Idempotent second open does not change the result or fail on missing rows.
+    migrated.close()
+    migrated = OrchestrationStore(path)
+    assert migrated.get_profile("opencode-main") is None
+    migrated.close()
+
+
+def test_legacy_default_profile_is_disabled_and_cleared_when_referenced(tmp_path):
+    path = tmp_path / "orchestration.db"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = OrchestrationStore(path)
+    _insert_legacy_default_profiles(store)
+    store.set_workspace_main_profile(workspace, "opencode-main")
+    store.close()
+
+    migrated = OrchestrationStore(path)
+    main = migrated.get_profile("opencode-main")
+    assert main is not None
+    assert main.enabled is False
+    assert main.capabilities == {}
+    assert main.capability_probe_fingerprint is None
+    assert migrated.get_workspace_main_profile(workspace).id == "opencode-main"
+    migrated.close()
+
+
+def test_legacy_pi_default_profile_is_disabled_and_cleared_when_referenced(tmp_path):
+    path = tmp_path / "orchestration.db"
+    store = OrchestrationStore(path)
+    _insert_legacy_default_profiles(store)
+    task = store.create_task(conversation_id="conv-1", title="pi referenced")
+    store.create_attempt(
+        task_id=task.id,
+        agent_profile_id="pi-experimental",
+        role=AgentRole.EXECUTOR,
+    )
+    store.close()
+
+    migrated = OrchestrationStore(path)
+    pi = migrated.get_profile("pi-experimental")
+    assert pi is not None
+    assert pi.enabled is False
+    assert pi.capabilities == {}
+    assert pi.capability_probe_fingerprint is None
+    assert migrated.list_attempts(task.id)[0].agent_profile_id == "pi-experimental"
+    migrated.close()
+
+
+def test_legacy_default_cleanup_preserves_structured_task_and_ledger_references(tmp_path):
+    path = tmp_path / "orchestration.db"
+    store = OrchestrationStore(path)
+    _insert_legacy_default_profiles(store)
+    task = store.create_task(
+        conversation_id="conv-1",
+        title="planned executor",
+        task_spec={
+            "plan": {
+                "members": [
+                    {
+                        "id": "executor:opencode-executor",
+                        "role": "executor",
+                        "profile_id": "opencode-executor",
+                        "objective": "Implement",
+                    }
+                ]
+            },
+            "note": "opencode-main appears only as text",
+        },
+    )
+    store.append_event(
+        LedgerEvent(
+            event_id="event-review-requested",
+            event_type="review.requested",
+            aggregate_type="task",
+            aggregate_id=task.id,
+            payload={
+                "review": {
+                    "reviewer_profile_id": "opencode-reviewer",
+                    "note": "pi-experimental appears only as text",
+                }
+            },
+        )
+    )
+    store.close()
+
+    migrated = OrchestrationStore(path)
+    executor = migrated.get_profile("opencode-executor")
+    reviewer = migrated.get_profile("opencode-reviewer")
+    assert executor is not None
+    assert executor.enabled is False
+    assert executor.capabilities == {}
+    assert executor.capability_probe_fingerprint is None
+    assert reviewer is not None
+    assert reviewer.enabled is False
+    assert reviewer.capabilities == {}
+    assert reviewer.capability_probe_fingerprint is None
+    assert migrated.get_profile("opencode-main") is None
+    assert migrated.get_profile("pi-experimental") is None
+
+    migrated.close()
+    reopened = OrchestrationStore(path)
+    assert reopened.get_profile("opencode-executor") is not None
+    assert reopened.get_profile("opencode-reviewer") is not None
+    reopened.close()
+
+
+def test_legacy_default_cleanup_preserves_user_modified_profile(tmp_path):
+    path = tmp_path / "orchestration.db"
+    store = OrchestrationStore(path)
+    _insert_legacy_default_profiles(store)
     main = store.get_profile("opencode-main")
     assert main is not None
     main.command = "/opt/custom/opencode"
@@ -133,14 +317,57 @@ def test_seed_default_profiles_preserves_user_configuration_and_capabilities(tmp
     main.capability_probe_fingerprint = main.identity_fingerprint()
     main.enabled = True
     store.put_profile(main)
-
-    seeded = {profile.id: profile for profile in store.seed_default_profiles()}
-
-    assert seeded["opencode-main"].command == "/opt/custom/opencode"
-    assert seeded["opencode-main"].args == ["acp", "--custom"]
-    assert seeded["opencode-main"].capabilities == {"session": {"resume": True}}
-    assert seeded["opencode-main"].enabled is True
     store.close()
+
+    migrated = OrchestrationStore(path)
+    kept = migrated.get_profile("opencode-main")
+    assert kept is not None
+    assert kept.command == "/opt/custom/opencode"
+    assert kept.args == ["acp", "--custom"]
+    assert kept.enabled is True
+    assert kept.capabilities == {"session": {"resume": True}}
+    migrated.close()
+
+
+def test_legacy_default_cleanup_preserves_user_modified_pi_profile(tmp_path):
+    path = tmp_path / "orchestration.db"
+    store = OrchestrationStore(path)
+    _insert_legacy_default_profiles(store)
+    pi = store.get_profile("pi-experimental")
+    assert pi is not None
+    pi.command = "/opt/custom/pi"
+    pi.args = ["--mode", "rpc", "--debug"]
+    pi.enabled = False
+    store.put_profile(pi)
+    store.close()
+
+    migrated = OrchestrationStore(path)
+    kept = migrated.get_profile("pi-experimental")
+    assert kept is not None
+    assert kept.command == "/opt/custom/pi"
+    assert kept.args == ["--mode", "rpc", "--debug"]
+    assert kept.enabled is False
+    migrated.close()
+
+
+def test_legacy_default_cleanup_preserves_real_probe(tmp_path):
+    path = tmp_path / "orchestration.db"
+    store = OrchestrationStore(path)
+    _insert_legacy_default_profiles(store)
+    main = store.get_profile("opencode-main")
+    assert main is not None
+    main.capabilities = {"agentInfo": {"name": "OpenCode"}}
+    main.capability_probe_fingerprint = main.identity_fingerprint()
+    main.enabled = True
+    store.put_profile(main)
+    store.close()
+
+    migrated = OrchestrationStore(path)
+    kept = migrated.get_profile("opencode-main")
+    assert kept is not None
+    assert kept.enabled is True
+    assert kept.capabilities == {"agentInfo": {"name": "OpenCode"}}
+    migrated.close()
 
 
 def test_reviewer_profile_and_attempt_are_forced_read_only(tmp_path):

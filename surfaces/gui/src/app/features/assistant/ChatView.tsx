@@ -28,6 +28,7 @@ import { Composer } from "./Composer";
 import { RightRail } from "./RightRail";
 import { sessionStatus, statusLine } from "./statusLine";
 import { Timeline, type TimelineAgent } from "./TimelineView";
+import { retryAnchor } from "./timeline";
 import { useSessionChat } from "./useSessionChat";
 
 const SUGGESTIONS = [
@@ -240,6 +241,8 @@ export function ChatView({ session, sessionId, railOpen, onToggleRail, onSession
   };
 
   const idle = state.items.length === 0 && !state.streaming;
+  const canRetryLastError = !state.running && retryAnchor(state.items) >= 0;
+  const showOfflineBanner = connectSession && !state.connected;
   // The header's live status line: bare for Q, "<agent> · …" for an ACP-served session.
   const status = sessionStatus(state);
   const acpName = agentChoice === "embedded" ? null : agentChoiceLabel(agentChoice);
@@ -289,6 +292,29 @@ export function ChatView({ session, sessionId, railOpen, onToggleRail, onSession
         {/* 时间线 */}
         <div className="hairline-scroll min-h-0 flex-1 overflow-y-auto" ref={scrollRef} onScroll={handleScroll}>
           <div className="mx-auto max-w-3xl px-6 py-6">
+            {(showOfflineBanner || state.historyStale) && (
+              <div
+                className="mb-4 flex items-center gap-2 rounded-lg border border-warnInk/30 bg-warnSoft px-3 py-2 text-[12.5px] text-warnInk"
+                data-testid="connection-banner"
+                role="status"
+              >
+                <span className="min-w-0 flex-1">
+                  {showOfflineBanner
+                    ? "连接已中断，正在自动重连。"
+                    : "正在显示缓存历史，内容可能不是最新。"}
+                </span>
+                {canRetryLastError && (
+                  <button
+                    type="button"
+                    className="shrink-0 rounded-md border border-current px-2 py-0.5 text-[11.5px] font-medium hover:opacity-80"
+                    data-testid="connection-retry"
+                    onClick={chat.retry}
+                  >
+                    重试上一轮
+                  </button>
+                )}
+              </div>
+            )}
             {idle ? (
               <div className="flex flex-col items-center pt-16 text-center">
                 <div className="accent-grad grid h-11 w-11 place-items-center rounded-xl2 text-white shadow-sm">

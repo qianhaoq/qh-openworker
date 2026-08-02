@@ -11,6 +11,22 @@ interface ErrorMapping {
 // 顺序即优先级:更具体的模式放前面。
 const MAPPINGS: readonly ErrorMapping[] = [
   {
+    re: /"code"\s*:\s*"MAIN_AGENT_MISSING"|Mission creation requires a workspace main Agent/,
+    text: "当前 workspace 缺少 main Agent。请返回首页添加并激活 main Agent。",
+  },
+  {
+    re: /"code"\s*:\s*"MAIN_AGENT_UNVERIFIED"|main Agent profile must be activated first/,
+    text: "当前 workspace 的 main Agent 还未激活。请返回首页添加并测试 main Agent。",
+  },
+  {
+    re: /"code"\s*:\s*"MAIN_AGENT_UNAVAILABLE"|main Agent profile is disabled|not an ACP runtime/,
+    text: "当前 workspace 的 main Agent 不可用。请到 Agents 修复或重新添加。",
+  },
+  {
+    re: /"code"\s*:\s*"WORKSPACE_REQUIRED"|Mission creation requires a workspace\.|Mission workspace must be an existing directory/,
+    text: "需要先选择一个可用 workspace。请返回首页添加 workspace。",
+  },
+  {
     // POST /v1/missions 400 — 没有可用「执行」profile(orchestrator.py)。
     re: /confirmed coding missions require an executor profile/,
     text: "需要先在 Agents 页招募并启用一个「执行」角色的 agent",

@@ -2,9 +2,12 @@
 // reducer (streaming deltas, tool lifecycle, prompts, notices), usage accumulation and the
 // stream gate. Socket-level integration uses the FakeWebSocket pattern from lib/ws.test.ts.
 
+import React from "react";
+import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Message, WsEvent } from "../../lib/api/types";
 import { SessionSocket } from "../../lib/ws";
+import { Timeline } from "./TimelineView";
 import {
   addTurnUsage,
   applyWsEvent,
@@ -23,6 +26,7 @@ import {
   userItemFromContent,
   type ChatState,
 } from "./timeline";
+import { reduceWsEventsInOrder } from "./useSessionChat";
 
 const NOW = 1_700_000_000_000; // fixed clock for deterministic ts/duration
 
@@ -120,6 +124,12 @@ describe("itemsFromMessages", () => {
 });
 
 describe("applyWsEvent — streaming", () => {
+  it("shows the first non-empty Chinese or short English assistant delta as an answer", () => {
+    const running = { ...initialChatState(), running: true };
+    expect(streamMode("你", running.items, true)).toBe("answer");
+    expect(streamMode("Hi", running.items, true)).toBe("answer");
+  });
+
   it("accumulates deltas and finalizes into an assistant item with reasoning + usage", () => {
     const events: WsEvent[] = [
       { type: "turn_start", data: { input: "你好" } },
@@ -149,6 +159,40 @@ describe("applyWsEvent — streaming", () => {
     expect(assistant.reasoning).toBe("先想一下");
     expect(totalTokens(state.usage)).toBe(18);
     expect(state.usage.context).toBe(13); // input + cache_read + cache_write
+  });
+
+  it("does not duplicate a repeated final assistant_message", () => {
+    const events: WsEvent[] = [
+      { type: "turn_start", data: { input: "你好" } },
+      { type: "assistant_delta", data: { text: "你" } },
+      { type: "assistant_delta", data: { text: "好" } },
+      { type: "assistant_message", data: { text: "你好", tool_calls: [], usage: { input: 1, output: 2, cache_read: 0, cache_write: 0 } } },
+      { type: "assistant_message", data: { text: "你好", tool_calls: [], usage: { input: 1, output: 2, cache_read: 0, cache_write: 0 } } },
+    ];
+    const state = reduce(initialChatState(), events);
+    const assistants = state.items.filter((i) => i.kind === "assistant");
+    expect(assistants).toHaveLength(1);
+    expect(assistants[0]).toMatchObject({ text: "你好" });
+    expect(totalTokens(state.usage)).toBe(3);
+  });
+
+  it("keeps rAF-batched websocket events in order without dropping deltas", () => {
+    const state = reduceWsEventsInOrder(initialChatState(), [
+      { type: "turn_start", data: { input: "run" } },
+      { type: "assistant_delta", data: { text: "A" } },
+      { type: "tool_proposed", data: { name: "read_file", arguments: { path: "a" } } },
+      { type: "assistant_delta", data: { text: "B" } },
+      { type: "tool_finished", data: { name: "read_file", status: "ok", result_preview: "done" } },
+      { type: "assistant_message", data: { text: "AB", tool_calls: [] } },
+    ], NOW);
+    expect(state.streaming).toBe("");
+    expect(state.items.map((i) => i.kind)).toEqual(["user", "tool", "assistant"]);
+    const tool = state.items[1];
+    if (tool.kind !== "tool") throw new Error("expected tool");
+    expect(tool.status).toBe("ok");
+    const assistant = state.items[2];
+    if (assistant.kind !== "assistant") throw new Error("expected assistant");
+    expect(assistant.text).toBe("AB");
   });
 
   it("turn_start de-duplicates the locally-echoed user message but appends background turns", () => {
@@ -274,19 +318,47 @@ describe("applyWsEvent — tools & prompts", () => {
 });
 
 describe("stream gate", () => {
-  it("holds turn-start trickles, keeps mid-turn text quiet, promotes long answers", () => {
+  it("promotes every non-empty stream directly to the live answer", () => {
     const running = { ...initialChatState(), running: true };
-    expect(streamMode("正在", running.items, true)).toBe("hold");
+    expect(streamMode("正在", running.items, true)).toBe("answer");
     const midItems = applyWsEvent(
       running,
       { type: "tool_proposed", data: { name: "read_file", arguments: {} } },
       NOW,
     ).items;
-    expect(streamMode("还在读", midItems, true)).toBe("quiet");
+    expect(streamMode("还在读", midItems, true)).toBe("answer");
     const long = Array.from({ length: 45 }, (_, i) => `词${i}`).join(" ");
     expect(streamMode(long, running.items, true)).toBe("answer");
     expect(streamMode("done", [], false)).toBe("answer");
     expect(streamMode("", [], true)).toBe("none");
+  });
+});
+
+describe("Timeline live rendering", () => {
+  it("keeps streamed answer text visible while a tool is running", () => {
+    const state = reduce(initialChatState(), [
+      { type: "turn_start", data: { input: "查文件" } },
+      { type: "tool_proposed", data: { name: "read_file", arguments: { path: "README.md" } } },
+      { type: "assistant_delta", data: { text: "我先查 README。" } },
+    ]);
+
+    render(
+      React.createElement(Timeline, {
+        items: state.items,
+        running: state.running,
+        compacting: state.compacting,
+        streaming: state.streaming,
+        reasoning: state.reasoning,
+        onRetry: vi.fn(),
+        onApprove: vi.fn(),
+        onRespondPlan: vi.fn(),
+        onRespondDirectory: vi.fn(),
+        onAnswerQuestion: vi.fn(),
+      }),
+    );
+
+    expect(screen.getByText("我先查 README。")).toBeTruthy();
+    expect(screen.getByTestId("step-running")).toBeTruthy();
   });
 });
 
@@ -347,6 +419,7 @@ class FakeWebSocket {
 }
 
 afterEach(() => {
+  cleanup();
   vi.unstubAllGlobals();
   FakeWebSocket.last = null;
 });

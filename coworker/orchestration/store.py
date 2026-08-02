@@ -67,6 +67,71 @@ def _canonical_workspace(workspace: str | Path) -> str:
     return str(Path(workspace).expanduser().resolve())
 
 
+_LEGACY_DEFAULT_PROFILES: tuple[dict[str, Any], ...] = (
+    {
+        "id": "opencode-main",
+        "role": AgentRole.MAIN,
+        "transport": "acp_stdio",
+        "command": "opencode",
+        "args": ["acp"],
+        "model_profile": "deepseek-coder",
+        "workspace_policy": "worktree",
+        "permission_policy": "coding-default",
+        "secret_refs": [],
+        "limits": {"timeout_seconds": 1800, "max_cost": 5},
+        "enabled": True,
+        "capabilities": {"preset": {"id": "opencode-main", "source": "qh-openworker-default"}},
+    },
+    {
+        "id": "opencode-executor",
+        "role": AgentRole.EXECUTOR,
+        "transport": "acp_stdio",
+        "command": "opencode",
+        "args": ["acp"],
+        "model_profile": "deepseek-coder",
+        "workspace_policy": "worktree",
+        "permission_policy": "coding-default",
+        "secret_refs": [],
+        "limits": {"timeout_seconds": 1800, "max_cost": 5},
+        "enabled": True,
+        "capabilities": {
+            "preset": {"id": "opencode-executor", "source": "qh-openworker-default"}
+        },
+    },
+    {
+        "id": "opencode-reviewer",
+        "role": AgentRole.REVIEWER,
+        "transport": "acp_stdio",
+        "command": "opencode",
+        "args": ["acp"],
+        "model_profile": "reviewer",
+        "workspace_policy": "readonly",
+        "permission_policy": "read-only",
+        "secret_refs": [],
+        "limits": {"timeout_seconds": 900, "max_cost": 2},
+        "enabled": True,
+        "capabilities": {
+            "preset": {"id": "opencode-reviewer", "source": "qh-openworker-default"}
+        },
+    },
+    {
+        "id": "pi-experimental",
+        "role": AgentRole.EXECUTOR,
+        "transport": "jsonl_rpc",
+        "command": "pi",
+        "args": ["--mode", "rpc"],
+        "model_profile": "experimental",
+        "workspace_policy": "worktree",
+        "permission_policy": "coding-default",
+        "secret_refs": [],
+        "limits": {"timeout_seconds": 1800, "max_cost": 5},
+        "enabled": False,
+        "capabilities": {},
+        "capability_probe_fingerprint": None,
+    },
+)
+
+
 class OrchestrationStore:
     """Durable control-plane store for qh-openworker agent orchestration."""
 
@@ -205,7 +270,113 @@ class OrchestrationStore:
             self._db.execute(
                 "ALTER TABLE agent_profiles ADD COLUMN capability_probe_fingerprint TEXT"
             )
+        self._cleanup_legacy_default_profiles()
         self._db.commit()
+
+    def _cleanup_legacy_default_profiles(self) -> None:
+        for data in _LEGACY_DEFAULT_PROFILES:
+            profile_data = {
+                key: value
+                for key, value in data.items()
+                if key != "capability_probe_fingerprint"
+            }
+            profile = AgentProfile(**profile_data)
+            row = self._db.execute(
+                "SELECT * FROM agent_profiles WHERE id = ?", (profile.id,)
+            ).fetchone()
+            if row is None:
+                continue
+            if not self._is_legacy_seeded_default(row, profile, data):
+                continue
+            if self._profile_is_referenced(profile.id):
+                self._db.execute(
+                    """
+                    UPDATE agent_profiles
+                    SET enabled = 0, capabilities_json = ?, capability_probe_fingerprint = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (_json_dumps({}), None, now_iso(), profile.id),
+                )
+            else:
+                self._db.execute("DELETE FROM agent_profiles WHERE id = ?", (profile.id,))
+
+    def _is_legacy_seeded_default(
+        self, row: sqlite3.Row, expected: AgentProfile, seed_data: dict[str, Any]
+    ) -> bool:
+        capabilities = _json_loads(row["capabilities_json"])
+        expected_fingerprint = seed_data.get(
+            "capability_probe_fingerprint", expected.identity_fingerprint()
+        )
+        return (
+            str(row["role"]) == expected.role.value
+            and str(row["transport"]) == expected.transport.value
+            and str(row["command"]) == expected.command
+            and _json_loads(row["args_json"]) == expected.args
+            and row["model_profile"] == expected.model_profile
+            and str(row["workspace_policy"]) == expected.workspace_policy
+            and str(row["permission_policy"]) == expected.permission_policy
+            and _json_loads(row["secret_refs_json"]) == expected.secret_refs
+            and _json_loads(row["limits_json"]) == expected.limits
+            and bool(row["enabled"]) == bool(seed_data.get("enabled", True))
+            and capabilities == seed_data.get("capabilities", {})
+            and row["capability_probe_fingerprint"] == expected_fingerprint
+        )
+
+    def _profile_is_referenced(self, profile_id: str) -> bool:
+        references = [
+            ("workspace_agent_profiles", "main_profile_id"),
+            ("agent_sessions", "agent_profile_id"),
+            ("attempts", "agent_profile_id"),
+            ("worktree_leases", "holder_profile_id"),
+        ]
+        for table, column in references:
+            row = self._db.execute(
+                f"SELECT 1 FROM {table} WHERE {column} = ? LIMIT 1", (profile_id,)
+            ).fetchone()
+            if row is not None:
+                return True
+        for row in self._db.execute("SELECT task_spec_json FROM tasks").fetchall():
+            if self._json_contains_profile_reference(
+                _json_loads(row["task_spec_json"]),
+                profile_id,
+            ):
+                return True
+        for row in self._db.execute("SELECT payload_json FROM ledger_events").fetchall():
+            if self._json_contains_profile_reference(
+                _json_loads(row["payload_json"]),
+                profile_id,
+            ):
+                return True
+        return False
+
+    @classmethod
+    def _json_contains_profile_reference(cls, value: Any, profile_id: str) -> bool:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if (
+                    (key == "profile_id" or key.endswith("_profile_id"))
+                    and cls._json_profile_value_matches(child, profile_id)
+                ):
+                    return True
+                if cls._json_contains_profile_reference(child, profile_id):
+                    return True
+        if isinstance(value, list):
+            return any(
+                cls._json_contains_profile_reference(child, profile_id)
+                for child in value
+            )
+        return False
+
+    @classmethod
+    def _json_profile_value_matches(cls, value: Any, profile_id: str) -> bool:
+        if isinstance(value, str):
+            return value == profile_id
+        if isinstance(value, list):
+            return any(cls._json_profile_value_matches(child, profile_id) for child in value)
+        if isinstance(value, dict):
+            return cls._json_contains_profile_reference(value, profile_id)
+        return False
 
     # -- agent profiles -----------------------------------------------------
     @_locked_method
@@ -1281,73 +1452,6 @@ class OrchestrationStore:
             if event.event_type == "task.transition" and event.payload.get("to") == "REWORK":
                 count += 1
         return count if row else 0
-
-    # -- convenience --------------------------------------------------------
-    @_locked_method
-    def seed_default_profiles(self) -> list[AgentProfile]:
-        """Install the MVP profile set without overwriting custom capability snapshots."""
-        profiles = [
-            AgentProfile(
-                id="opencode-main",
-                role=AgentRole.MAIN,
-                transport="acp_stdio",
-                command="opencode",
-                args=["acp"],
-                model_profile="deepseek-coder",
-                workspace_policy="worktree",
-                permission_policy="coding-default",
-                limits={"timeout_seconds": 1800, "max_cost": 5},
-            ),
-            AgentProfile(
-                id="opencode-executor",
-                role=AgentRole.EXECUTOR,
-                transport="acp_stdio",
-                command="opencode",
-                args=["acp"],
-                model_profile="deepseek-coder",
-                workspace_policy="worktree",
-                permission_policy="coding-default",
-                limits={"timeout_seconds": 1800, "max_cost": 5},
-            ),
-            AgentProfile(
-                id="opencode-reviewer",
-                role=AgentRole.REVIEWER,
-                transport="acp_stdio",
-                command="opencode",
-                args=["acp"],
-                model_profile="reviewer",
-                workspace_policy="readonly",
-                permission_policy="read-only",
-                limits={"timeout_seconds": 900, "max_cost": 2},
-            ),
-            AgentProfile(
-                id="pi-experimental",
-                role=AgentRole.EXECUTOR,
-                transport="jsonl_rpc",
-                command="pi",
-                args=["--mode", "rpc"],
-                model_profile="experimental",
-                workspace_policy="worktree",
-                permission_policy="coding-default",
-                enabled=False,
-                limits={"timeout_seconds": 1800, "max_cost": 5},
-            ),
-        ]
-        for profile in profiles:
-            if profile.id != "pi-experimental":
-                profile.capabilities = {
-                    "preset": {
-                        "id": profile.id,
-                        "source": "qh-openworker-default",
-                    }
-                }
-                profile.capability_probe_fingerprint = profile.identity_fingerprint()
-                profile.enabled = True
-        seeded: list[AgentProfile] = []
-        for profile in profiles:
-            existing = self.get_profile(profile.id)
-            seeded.append(existing if existing is not None else self.put_profile(profile))
-        return seeded
 
     @_locked_method
     def replay_events(self, events: Iterable[LedgerEvent | dict[str, Any]]) -> int:

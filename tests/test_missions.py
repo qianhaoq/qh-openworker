@@ -1,3 +1,4 @@
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -11,7 +12,56 @@ from coworker.server.manager import SessionManager
 
 
 def _service(tmp_path) -> QhOrchestratorStore:
-    return QhOrchestratorStore(tmp_path / "missions.db")
+    service = QhOrchestratorStore(tmp_path / "missions.db")
+    _install_profiles(service)
+    return service
+
+
+def _enable(profile: AgentProfile) -> AgentProfile:
+    profile.capabilities = {"agentInfo": {"name": profile.id}}
+    profile.capability_probe_fingerprint = profile.identity_fingerprint()
+    profile.enabled = True
+    return profile
+
+
+def _install_profiles(service: QhOrchestratorStore, workspace=None) -> None:
+    for profile in (
+        AgentProfile(
+            id="opencode-main",
+            role="main",
+            transport="acp_stdio",
+            command="opencode",
+            args=["acp"],
+            model_profile="deepseek-coder",
+            permission_policy="coding-default",
+        ),
+        AgentProfile(
+            id="opencode-executor",
+            role="executor",
+            transport="acp_stdio",
+            command="opencode",
+            args=["acp"],
+            model_profile="deepseek-coder",
+            permission_policy="coding-default",
+        ),
+        AgentProfile(
+            id="opencode-reviewer",
+            role="reviewer",
+            transport="acp_stdio",
+            command="opencode",
+            args=["acp"],
+            model_profile="reviewer",
+            workspace_policy="readonly",
+            permission_policy="read-only",
+        ),
+    ):
+        service.put(_enable(profile))
+    if workspace is not None:
+        service.set_workspace_main(workspace, "opencode-main")
+
+
+def _install_manager_profiles(manager: SessionManager, workspace) -> None:
+    _install_profiles(manager.orchestrator, workspace)
 
 
 def test_mission_plan_requires_confirmation_before_attempt(tmp_path):
@@ -173,6 +223,7 @@ async def test_main_acp_proposes_structured_plan_before_confirmation(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     manager = SessionManager(workspace=workspace, data_dir=tmp_path / "data")
+    _install_manager_profiles(manager, workspace)
 
     class FakePlanningAdapter:
         def __init__(self):
@@ -263,6 +314,7 @@ def test_mission_rest_websocket_and_profile_delete_contract(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     manager = SessionManager(data_dir=tmp_path / "data")
+    _install_manager_profiles(manager, workspace)
     manager.start_team_worker = lambda: None  # type: ignore[method-assign]
     app = create_app(manager)
 
@@ -272,7 +324,8 @@ def test_mission_rest_websocket_and_profile_delete_contract(tmp_path):
             json={"goal": "Must not create without a workspace"},
         )
         assert missing.status_code == 422
-        assert missing.json()["detail"]["code"] == "MISSION_WORKSPACE_REQUIRED"
+        assert missing.json()["detail"]["code"] == "WORKSPACE_REQUIRED"
+        assert missing.json()["detail"]["legacy_code"] == "MISSION_WORKSPACE_REQUIRED"
         assert client.get("/v1/missions").json()["missions"] == []
 
         created = client.post(
@@ -351,12 +404,256 @@ def test_mission_rest_websocket_and_profile_delete_contract(tmp_path):
         assert client.delete("/v1/agent-profiles/temporary-explorer").status_code == 404
 
 
+def test_readiness_and_mission_gate_share_main_agent_state(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    manager = SessionManager(data_dir=tmp_path / "data")
+    manager.start_team_worker = lambda: None  # type: ignore[method-assign]
+    app = create_app(manager)
+
+    with TestClient(app) as client:
+        ready = client.get("/v1/readiness", params={"workspace": str(workspace)}).json()
+        assert ready["workspace_valid"] is True
+        assert ready["main_agent"] == "missing"
+        assert ready["model_ready"] is False
+        assert ready["can_create_mission"] is False
+        missing = client.post(
+            "/v1/missions",
+            json={"goal": "needs main", "workspace": str(workspace)},
+        )
+        assert missing.status_code == 422
+        assert missing.json()["detail"]["code"] == "MAIN_AGENT_MISSING"
+
+        profile = AgentProfile(
+            id="manual-main",
+            role="main",
+            transport="acp_stdio",
+            command="opencode",
+            args=["acp"],
+        )
+        manager.orchestrator.put(profile)
+        # Store API requires enabled+probed for binding, so insert a legacy-style
+        # unverified binding to exercise the readiness and Mission gate.
+        manager.orchestrator.store._db.execute(
+            "INSERT INTO workspace_agent_profiles(workspace, main_profile_id) VALUES (?, ?)",
+            (str(workspace.resolve()), profile.id),
+        )
+        manager.orchestrator.store._db.commit()
+
+        unverified = client.get(
+            "/v1/readiness", params={"workspace": str(workspace)}
+        ).json()
+        assert unverified["main_agent"] == "unverified"
+        gated = client.post(
+            "/v1/missions",
+            json={"goal": "needs probe", "workspace": str(workspace)},
+        )
+        assert gated.status_code == 422
+        assert gated.json()["detail"]["code"] == "MAIN_AGENT_UNVERIFIED"
+
+        _install_profiles(manager.orchestrator)
+        ready_profile = manager.orchestrator.get("manual-main")
+        assert ready_profile is not None
+        ready_profile.capabilities = {"agentInfo": {"name": "Manual"}}
+        ready_profile.capability_probe_fingerprint = ready_profile.identity_fingerprint()
+        ready_profile.enabled = True
+        manager.orchestrator.put(ready_profile)
+        ready = client.get("/v1/readiness", params={"workspace": str(workspace)}).json()
+        assert ready["model_ready"] is False
+        assert ready["main_agent"] == "ready"
+        assert ready["can_create_mission"] is True
+        assert client.get("/v1/settings").json()["onboarded"] is False
+
+        created = client.post(
+            "/v1/missions",
+            json={
+                "goal": "model key is not required for ACP Mission",
+                "workspace": str(workspace),
+                "planning_mode": "control_plane",
+            },
+        )
+        assert created.status_code == 200
+        assert client.get("/v1/settings").json()["onboarded"] is True
+
+
+def test_main_only_readiness_allows_planning_but_confirmation_requires_executor(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    manager = SessionManager(data_dir=tmp_path / "data")
+    manager.start_team_worker = lambda: None  # type: ignore[method-assign]
+    main = _enable(
+        AgentProfile(
+            id="manual-main",
+            role="main",
+            transport="acp_stdio",
+            command="opencode",
+            args=["acp"],
+        )
+    )
+    manager.orchestrator.put(main)
+    manager.orchestrator.set_workspace_main(workspace, main.id)
+
+    with TestClient(create_app(manager)) as client:
+        ready = client.get("/v1/readiness", params={"workspace": str(workspace)}).json()
+        assert ready["model_ready"] is False
+        assert ready["main_agent"] == "ready"
+        assert ready["can_create_mission"] is True
+
+        created = client.post(
+            "/v1/missions",
+            json={
+                "goal": "draft a plan before execution Agent exists",
+                "workspace": str(workspace),
+                "planning_mode": "control_plane",
+            },
+        )
+        assert created.status_code == 200
+        mission = created.json()
+        assert mission["state"] == "AWAITING_CONFIRMATION"
+        assert [member["role"] for member in mission["plan"]["members"]] == ["main"]
+        assert mission["task_spec"]["_orchestration"]["target_profile_id"] == ""
+
+        confirmed = client.post(f"/v1/missions/{mission['mission_id']}/confirm", json={})
+        assert confirmed.status_code == 409
+        assert "add an execution Agent" in confirmed.json()["detail"]
+
+
+def test_activate_agent_profile_failure_keeps_profile_disabled(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manager = SessionManager(workspace=workspace, data_dir=tmp_path / "data")
+    profile = AgentProfile(
+        id="manual-main",
+        role="main",
+        transport="acp_stdio",
+        command="opencode",
+        args=["acp"],
+    )
+    manager.orchestrator.put(profile)
+
+    class FailingProbeAdapter:
+        async def probe(self, profile, *, cwd):
+            raise RuntimeError("handshake failed")
+
+    manager.acp_adapter = FailingProbeAdapter()  # type: ignore[assignment]
+
+    with TestClient(create_app(manager)) as client:
+        failed = client.post(
+            "/v1/agent-profiles/manual-main/activate",
+            json={"workspace": str(workspace)},
+        )
+        assert failed.status_code == 400
+        assert failed.json()["detail"]["code"] == "AGENT_PROFILE_ACTIVATE_FAILED"
+
+        saved = manager.orchestrator.get("manual-main")
+        assert saved is not None
+        assert saved.enabled is False
+        assert saved.capabilities == {}
+        assert saved.capability_probe_fingerprint is None
+
+
+def test_activate_enabled_agent_profile_failure_clears_previous_probe(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manager = SessionManager(workspace=workspace, data_dir=tmp_path / "data")
+    profile = _enable(
+        AgentProfile(
+            id="manual-main",
+            role="main",
+            transport="acp_stdio",
+            command="opencode",
+            args=["acp"],
+        )
+    )
+    manager.orchestrator.put(profile)
+
+    class FailingProbeAdapter:
+        async def probe(self, profile, *, cwd):
+            assert profile.enabled is False
+            assert profile.capabilities == {}
+            assert profile.capability_probe_fingerprint is None
+            raise RuntimeError("handshake failed")
+
+    manager.acp_adapter = FailingProbeAdapter()  # type: ignore[assignment]
+
+    with TestClient(create_app(manager)) as client:
+        failed = client.post(
+            "/v1/agent-profiles/manual-main/activate",
+            json={"workspace": str(workspace)},
+        )
+        assert failed.status_code == 400
+
+        saved = manager.orchestrator.get("manual-main")
+        assert saved is not None
+        assert saved.enabled is False
+        assert saved.capabilities == {}
+        assert saved.capability_probe_fingerprint is None
+
+
+def test_activate_agent_profile_rejects_stale_probe_after_concurrent_identity_update(
+    tmp_path,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manager = SessionManager(workspace=workspace, data_dir=tmp_path / "data")
+    profile = _enable(
+        AgentProfile(
+            id="manual-main",
+            role="main",
+            transport="acp_stdio",
+            command="opencode",
+            args=["acp"],
+        )
+    )
+    manager.orchestrator.put(profile)
+
+    class SlowProbeAdapter:
+        async def probe(self, profile, *, cwd):
+            assert profile.enabled is False
+            await asyncio.sleep(0)
+            current = manager.orchestrator.get("manual-main")
+            assert current is not None
+            current.command = "new-opencode"
+            current.args = ["acp", "--new"]
+            current.enabled = False
+            current.capabilities = {}
+            current.capability_probe_fingerprint = None
+            manager.orchestrator.put(current)
+            return {"agentInfo": {"name": "stale-probe"}}
+
+    manager.acp_adapter = SlowProbeAdapter()  # type: ignore[assignment]
+
+    with TestClient(create_app(manager)) as client:
+        failed = client.post(
+            "/v1/agent-profiles/manual-main/activate",
+            json={"workspace": str(workspace)},
+        )
+        assert failed.status_code == 400
+        detail = failed.json()["detail"]
+        assert detail["code"] == "AGENT_PROFILE_ACTIVATE_FAILED"
+        assert "changed during activation" in detail["message"]
+        assert "retry" in detail["message"]
+
+        saved = manager.orchestrator.get("manual-main")
+        assert saved is not None
+        assert saved.command == "new-opencode"
+        assert saved.args == ["acp", "--new"]
+        assert saved.enabled is False
+        assert saved.capabilities == {}
+        assert saved.capability_probe_fingerprint is None
+
+
 def test_mission_creation_websocket_streams_main_agent_output_before_final_projection(
     tmp_path,
 ):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     manager = SessionManager(workspace=workspace, data_dir=tmp_path / "data")
+    _install_manager_profiles(manager, workspace)
     manager.start_team_worker = lambda: None  # type: ignore[method-assign]
 
     plan = {
@@ -444,6 +741,7 @@ async def test_mission_operational_planning_failure_persists_blocked_without_fal
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     manager = SessionManager(workspace=workspace, data_dir=tmp_path / "data")
+    _install_manager_profiles(manager, workspace)
 
     class AuthFailureAdapter:
         async def open_session(self, profile, *, cwd, checkpoint, mcp_servers):
@@ -477,6 +775,7 @@ async def test_mission_invalid_main_output_uses_explicit_fallback(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     manager = SessionManager(workspace=workspace, data_dir=tmp_path / "data")
+    _install_manager_profiles(manager, workspace)
 
     class InvalidOutputAdapter:
         async def open_session(self, profile, *, cwd, checkpoint, mcp_servers):
@@ -503,6 +802,7 @@ async def test_mission_invalid_main_output_uses_explicit_fallback(tmp_path):
 
 def test_manager_attempt_default_uses_executor_profile(tmp_path):
     manager = SessionManager(data_dir=tmp_path / "data")
+    _install_profiles(manager.orchestrator)
     task = manager.delegate_agent_task({"task_spec": {"prompt": "execute"}})
     attempt = manager.start_agent_attempt(task["task_id"], {})
     assert attempt["agent_profile_id"] == "opencode-executor"

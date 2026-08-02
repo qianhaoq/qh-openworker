@@ -808,6 +808,24 @@ export async function mockApi(page: import("@playwright/test").Page) {
           send("turn_done");
           return;
         }
+        if (/three frame stream/i.test(msg.text)) {
+          const parts = ["中", "文", "流"];
+          let index = 0;
+          const push = () => {
+            send("assistant_delta", { text: parts[index] });
+            index += 1;
+            if (index < parts.length) {
+              setTimeout(push, 35);
+              return;
+            }
+            setTimeout(() => {
+              send("assistant_message", { text: parts.join("") });
+              send("turn_done");
+            }, 35);
+          };
+          setTimeout(push, 0);
+          return;
+        }
         // A deliberately SLOW multi-second stream (~40 ticks × 120ms) so specs can
         // interact mid-turn — the follow/pin scroll contract (FB-004) is untestable
         // against the instant echo below.
@@ -1010,6 +1028,33 @@ export async function mockApi(page: import("@playwright/test").Page) {
     }
 
     // -- ACP agent profiles (Agents page + mission detail's plan/team views) -------------
+    if (p.endsWith("/v1/readiness")) {
+      const profile = agentProfiles.find((item) => item.id === mainProfileId) ?? null;
+      const workspace = new URL(req.url()).searchParams.get("workspace") || PRIMARY_ROOT.path;
+      const mainAgent = !profile
+        ? "missing"
+        : !profile.capability_probe_fingerprint || !Object.keys(profile.capabilities ?? {}).length
+          ? "unverified"
+          : !profile.enabled
+            ? "unavailable"
+            : "ready";
+      return json({
+        model_ready: SETTINGS.model_ready,
+        workspace,
+        workspace_valid: true,
+        main_agent: mainAgent,
+        main_profile: profile,
+        can_create_mission: mainAgent === "ready",
+        next_action:
+          mainAgent === "missing"
+            ? "select_main_agent"
+            : mainAgent === "unverified"
+              ? "activate_main_agent"
+              : mainAgent === "unavailable"
+                ? "fix_main_agent"
+                : "create_mission",
+      });
+    }
     // `main` must precede the /:id patterns (it parses as one).
     if (p.endsWith("/v1/agent-profiles/main")) {
       if (m === "POST") {
@@ -1043,6 +1088,18 @@ export async function mockApi(page: import("@playwright/test").Page) {
         agentInfo: { name: prof.command || "agent", version: "1.0" },
       };
       prof.capability_probe_fingerprint = `fp-${id}`;
+      return json({ ok: true, profile: prof, capabilities: prof.capabilities });
+    }
+    if (/\/v1\/agent-profiles\/[^/]+\/activate$/.test(p) && m === "POST") {
+      const id = decodeURIComponent(p.split("/").slice(-2)[0]);
+      const prof = agentProfiles.find((x) => x.id === id);
+      if (!prof) return json({ detail: id }, 404);
+      prof.capabilities = {
+        agentCapabilities: { loadSession: true, promptCapabilities: { image: true } },
+        agentInfo: { name: prof.command || "agent", version: "1.0" },
+      };
+      prof.capability_probe_fingerprint = `fp-${id}`;
+      prof.enabled = true;
       return json({ ok: true, profile: prof, capabilities: prof.capabilities });
     }
     if (/\/v1\/agent-profiles\/[^/]+$/.test(p) && m === "DELETE") {

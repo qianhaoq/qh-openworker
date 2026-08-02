@@ -2,6 +2,18 @@ import { describe, expect, it } from "vitest";
 import { humanizeErrorText } from "./errorText";
 
 describe("humanizeErrorText", () => {
+  it("maps mission readiness gate codes to repair-focused copy", () => {
+    expect(humanizeErrorText('{"code":"WORKSPACE_REQUIRED","message":"Mission creation requires a workspace."}')).toBe(
+      "需要先选择一个可用 workspace。请返回首页添加 workspace。",
+    );
+    expect(humanizeErrorText('{"code":"MAIN_AGENT_MISSING","message":"Mission creation requires a workspace main Agent."}')).toBe(
+      "当前 workspace 缺少 main Agent。请返回首页添加并激活 main Agent。",
+    );
+    expect(humanizeErrorText('{"code":"MAIN_AGENT_UNVERIFIED","message":"The workspace main Agent profile must be activated first."}')).toBe(
+      "当前 workspace 的 main Agent 还未激活。请返回首页添加并测试 main Agent。",
+    );
+  });
+
   it("maps the mission-create executor 400", () => {
     expect(humanizeErrorText("confirmed coding missions require an executor profile")).toBe(
       "需要先在 Agents 页招募并启用一个「执行」角色的 agent",

@@ -256,16 +256,11 @@ export function formatTokens(n: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// Stream gate: ONE rule for where streamed text renders (ported from streamGate.ts).
-//   "hold"   turn-start, under the threshold — show nothing but the spinner.
-//   "quiet"  mid-turn, under the threshold — the text rides the live turn group.
-//   "answer" crossed the threshold with no tool call — render the streaming bubble.
-//   "none"   nothing streaming.
+// Stream placement: the first non-empty assistant_delta is visible as the live answer.
+// Tool/reasoning activity is rendered separately by the view.
 // ---------------------------------------------------------------------------
 
-export const STREAM_PROMOTE_WORDS = 40;
-
-export type StreamMode = "none" | "hold" | "quiet" | "answer";
+export type StreamMode = "none" | "answer";
 
 export function midTurn(items: TimelineItem[], running: boolean): boolean {
   if (!running) return false;
@@ -278,10 +273,10 @@ export function midTurn(items: TimelineItem[], running: boolean): boolean {
 }
 
 export function streamMode(streaming: string, items: TimelineItem[], running: boolean): StreamMode {
+  void items;
+  void running;
   if (!streaming) return "none";
-  const words = streaming.trim().split(/\s+/).filter(Boolean).length;
-  if (words >= STREAM_PROMOTE_WORDS || !running) return "answer";
-  return midTurn(items, running) ? "quiet" : "hold";
+  return "answer";
 }
 
 export function lastItemIsAssistant(items: TimelineItem[]): boolean {
@@ -420,6 +415,8 @@ export interface ChatState {
   mode: string | null;
   /** Adopted from `ready`: the server-provisioned scratch dir for brand-new sessions. */
   workspace: string | null;
+  /** The visible timeline came from cache and has not been refreshed by history yet. */
+  historyStale: boolean;
   usage: SessionUsage;
   todo: TodoItem[];
   /** Sticky: once any todo_write arrives the 待办 tab exists (even after the list clears). */
@@ -437,6 +434,7 @@ export const initialChatState = (): ChatState => ({
   model: null,
   mode: null,
   workspace: null,
+  historyStale: false,
   usage: emptyUsage(),
   todo: [],
   todoSeen: false,
@@ -444,11 +442,15 @@ export const initialChatState = (): ChatState => ({
 
 /** Hydrate from history (session load/switch). Keeps connection flags. */
 export function hydrateChat(state: ChatState, items: TimelineItem[], usage: SessionUsage): ChatState {
-  return { ...state, items, usage, streaming: "", reasoning: "", todo: [], todoSeen: false };
+  return { ...state, items, usage, streaming: "", reasoning: "", historyStale: false, todo: [], todoSeen: false };
 }
 
 export function markConnected(state: ChatState, connected: boolean): ChatState {
   return { ...state, connected };
+}
+
+export function markHistoryStale(state: ChatState, historyStale: boolean): ChatState {
+  return { ...state, historyStale };
 }
 
 export function markUnattended(state: ChatState, unattended: boolean): ChatState {
@@ -527,13 +529,22 @@ export function applyWsEvent(state: ChatState, ev: WsEvent, now: number = Date.n
       return { ...state, reasoning: state.reasoning + (ev.data.text || "") };
     case "assistant_message": {
       const reasoning = ev.data.reasoning || state.reasoning;
+      const finalText = ev.data.text || "";
+      const last = state.items[state.items.length - 1];
+      const hasFinalContent = !!(finalText || reasoning);
+      const duplicateFinal =
+        hasFinalContent &&
+        last?.kind === "assistant" &&
+        last.text === finalText &&
+        (last.reasoning || "") === (reasoning || "");
+      const shouldAppend = hasFinalContent && !duplicateFinal;
       const items =
-        ev.data.text || reasoning
+        shouldAppend
           ? [
               ...state.items,
               {
                 kind: "assistant" as const,
-                text: ev.data.text || "",
+                text: finalText,
                 ts: now / 1000,
                 ...(reasoning ? { reasoning } : {}),
               },
@@ -544,7 +555,7 @@ export function applyWsEvent(state: ChatState, ev: WsEvent, now: number = Date.n
         items,
         streaming: "",
         reasoning: "",
-        usage: ev.data.usage ? addTurnUsage(state.usage, ev.data.usage) : state.usage,
+        usage: ev.data.usage && !duplicateFinal ? addTurnUsage(state.usage, ev.data.usage) : state.usage,
       };
     }
     case "tool_proposed": {

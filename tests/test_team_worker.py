@@ -149,6 +149,39 @@ def _manager(tmp_path: Path, repo: Path, adapter: FakeAgentAdapter) -> SessionMa
     mgr = SessionManager(workspace=repo, data_dir=tmp_path / "data")
     mgr.acp_adapter = adapter
     mgr.worktrees = WorktreeManager(mgr.orchestrator.store, worktree_root=tmp_path / "worktrees")
+    _put_probed_profile(
+        mgr,
+        {
+            "id": "opencode-main",
+            "role": "main",
+            "transport": "acp_stdio",
+            "command": "opencode",
+            "args": ["acp"],
+        },
+    )
+    _put_probed_profile(
+        mgr,
+        {
+            "id": "opencode-executor",
+            "role": "executor",
+            "transport": "acp_stdio",
+            "command": "opencode",
+            "args": ["acp"],
+        },
+    )
+    _put_probed_profile(
+        mgr,
+        {
+            "id": "opencode-reviewer",
+            "role": "reviewer",
+            "transport": "acp_stdio",
+            "command": "opencode",
+            "args": ["acp"],
+            "workspace_policy": "readonly",
+            "permission_policy": "read-only",
+        },
+    )
+    mgr.orchestrator.set_workspace_main(repo, "opencode-main")
     return mgr
 
 
