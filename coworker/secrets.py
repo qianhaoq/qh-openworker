@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import re
 import subprocess
 import sys
@@ -34,16 +35,63 @@ def state_dir() -> Path:
     3. Windows: `%APPDATA%\\qh-openworker`.
     4. macOS / Linux: `~/.config/qh-openworker`.
     """
-    base = os.environ.get("QH_OPENWORKER_STATE_DIR") or os.environ.get(
-        "COWORKER_STATE_DIR"
-    )
-    if base:
-        return Path(base).expanduser()
+    qh_state_dir = os.environ.get("QH_OPENWORKER_STATE_DIR")
+    if qh_state_dir:
+        return Path(qh_state_dir).expanduser()
+    legacy_state_dir = os.environ.get("COWORKER_STATE_DIR")
+    if legacy_state_dir:
+        return Path(legacy_state_dir).expanduser()
     if sys.platform == "win32":
         appdata = os.environ.get("APPDATA")
         if appdata:
             return Path(appdata) / "qh-openworker"
-    return Path.home() / ".config" / "qh-openworker"
+    base = _home_dir() / ".config" / "qh-openworker"
+    _migrate_legacy_state_dir(base)
+    return base
+
+
+def _home_dir() -> Path:
+    return Path(os.environ.get("HOME", str(Path.home()))).expanduser()
+
+
+def _legacy_state_dir() -> Path:
+    return _home_dir() / ".config" / "coworker"
+
+
+def _merge_trees(source: Path, destination: Path) -> None:
+    for entry in source.iterdir():
+        if entry.name.startswith("."):
+            # Keep hidden/legacy marker files untouched unless needed by secrets/.env migration.
+            if entry.name not in {".env"}:
+                continue
+        target = destination / entry.name
+        if entry.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            _merge_trees(entry, target)
+            continue
+        if target.exists():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(entry, target)
+        except OSError:
+            pass
+
+
+def _migrate_legacy_state_dir(base: Path) -> None:
+    legacy = _legacy_state_dir()
+    if not legacy.is_dir() or legacy == base:
+        return
+    try:
+        destination = base / "migrated-from-legacy"
+        if destination.is_file():
+            return
+        if not base.exists():
+            base.mkdir(parents=True, exist_ok=True)
+        _merge_trees(legacy, base)
+        destination.touch(exist_ok=True)
+    except OSError:
+        pass
 
 
 def _load_dotenv(path: Path) -> dict[str, str]:

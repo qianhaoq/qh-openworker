@@ -7,6 +7,8 @@ import stat
 import subprocess
 import sys
 import time
+import json
+from pathlib import Path
 
 from coworker.secrets import SecretStore, state_dir
 
@@ -56,6 +58,26 @@ def test_unresolved_ref_left_intact(tmp_path):
     store = SecretStore(tmp_path / "secrets.json")
     store.put("x", {"v": "${NOPE_NOT_SET}"})
     assert store.get("x")["v"] == "${NOPE_NOT_SET}"
+
+
+def test_state_dir_migrates_legacy_state(tmp_path, monkeypatch):
+    old_home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(old_home))
+    monkeypatch.delenv("COWORKER_STATE_DIR", raising=False)
+    old_state = old_home / ".config" / "coworker"
+    old_state.mkdir(parents=True)
+    (old_state / "secrets.json").write_text(
+        json.dumps({"legacy:default": {"api_key": "token-from-legacy"}}),
+        encoding="utf-8",
+    )
+    (old_state / ".env").write_text('LEGACY_API_KEY="legacy_env"\n', encoding="utf-8")
+
+    new_store = SecretStore()
+    assert new_store.get("legacy:default") == {"api_key": "token-from-legacy"}
+    assert new_store.resolve("${LEGACY_API_KEY}") == "legacy_env"
+    assert (new_store.path.parent / ".env").is_file()
+    assert state_dir() == old_home / ".config" / "qh-openworker"
+    assert (state_dir() / "secrets.json").is_file()
 
 
 def test_status_hides_values(tmp_path):
