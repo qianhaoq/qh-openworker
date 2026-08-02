@@ -4,6 +4,15 @@ import { test as base, expect, type Page } from "@playwright/test";
 // push server events through it via sendAppEvent below.
 const eventSockets = new WeakMap<Page, { send: (data: string) => void }>();
 
+// Every /ws/session/{id} URL the app opened (per page, in order) — specs assert the
+// query params the chat view binds its socket with (runtime / profile_id).
+const sessionSocketsByPage = new WeakMap<Page, string[]>();
+
+/** The /ws/session URLs this page has opened so far. */
+export function sessionSocketUrls(page: Page): string[] {
+  return sessionSocketsByPage.get(page) ?? [];
+}
+
 /** Push an app-wide event exactly as the server would over /ws/events. Waits for
  * the GUI to have connected its socket first. */
 export async function sendAppEvent(page: Page, obj: unknown): Promise<void> {
@@ -341,6 +350,67 @@ const PROVIDERS = [
   { name: "ollama", title: "Ollama (local models)", needs_key: false, fields: [{ key: "base_url", label: "Endpoint", secret: false, required: false, help: "", placeholder: "http://127.0.0.1:11434", default: "http://127.0.0.1:11434" }], configured: true, values: {}, suggested_models: ["qwen3-coder:30b"], key_set_at: null, last_used_at: null },
 ];
 
+// ACP agent profiles (the Agents page + the mission detail's plan/team views + the chat
+// header's agent picker). Five are pre-probed + enabled (kimi-main is the workspace main;
+// claude-code-main / codex-main are the picker spec's bind targets); opencode-reviewer
+// too, so the seeded mission's reviewer seat resolves. Save/probe/enable round-trip
+// through the per-test mutable copy inside mockApi.
+// Exported for tests that route-override /v1/agent-profiles (e.g. "no usable executor").
+export const AGENT_PROFILES = [
+  { id: "kimi-main", role: "main", transport: "acp_stdio", command: "kimi", args: ["acp"], model_profile: null, workspace_policy: "worktree", permission_policy: "coding-default", secret_refs: [], limits: {}, enabled: true, capabilities: { agentCapabilities: { loadSession: true }, agentInfo: { name: "kimi-cli", version: "1.0" } }, capability_probe_fingerprint: "fp-kimi-main" },
+  { id: "opencode-executor", role: "executor", transport: "acp_stdio", command: "opencode", args: ["acp"], model_profile: null, workspace_policy: "worktree", permission_policy: "coding-default", secret_refs: [], limits: {}, enabled: true, capabilities: { agentCapabilities: { loadSession: true }, agentInfo: { name: "opencode", version: "0.9" } }, capability_probe_fingerprint: "fp-opencode-executor" },
+  { id: "opencode-reviewer", role: "reviewer", transport: "acp_stdio", command: "opencode", args: ["acp"], model_profile: null, workspace_policy: "readonly", permission_policy: "read-only", secret_refs: [], limits: {}, enabled: true, capabilities: { agentCapabilities: { loadSession: true } }, capability_probe_fingerprint: "fp-opencode-reviewer" },
+  { id: "claude-code-main", role: "main", transport: "acp_stdio", command: "npx", args: ["-y", "@zed-industries/claude-code-acp"], model_profile: null, workspace_policy: "worktree", permission_policy: "coding-default", secret_refs: [], limits: {}, enabled: true, capabilities: { agentCapabilities: { loadSession: true }, agentInfo: { name: "claude-code-acp", version: "0.1" } }, capability_probe_fingerprint: "fp-claude-code-main" },
+  { id: "codex-main", role: "main", transport: "acp_stdio", command: "npx", args: ["-y", "@zed-industries/codex-acp"], model_profile: null, workspace_policy: "worktree", permission_policy: "coding-default", secret_refs: [], limits: {}, enabled: true, capabilities: { agentCapabilities: { loadSession: true }, agentInfo: { name: "codex-acp", version: "0.1" } }, capability_probe_fingerprint: "fp-codex-main" },
+];
+
+// The seeded mission's team: one seat per role, ids in the "role:profile_id" convention,
+// reviewer depending on the executor (mirrors the control plane's default team).
+const MISSION_MEMBERS = [
+  { id: "main:kimi-main", seat_id: "main:kimi-main", role: "main", profile_id: "kimi-main", objective: "拆解目标、协调团队并汇总交付", depends_on: [] as string[], dependencies: [] as string[], status: "planned" },
+  { id: "executor:opencode-executor", seat_id: "executor:opencode-executor", role: "executor", profile_id: "opencode-executor", objective: "在受控 worktree 中实现修改", depends_on: ["main:kimi-main"], dependencies: ["main:kimi-main"], status: "planned" },
+  { id: "reviewer:opencode-reviewer", seat_id: "reviewer:opencode-reviewer", role: "reviewer", profile_id: "opencode-reviewer", objective: "只读审查 diff 与测试结果", depends_on: ["executor:opencode-executor"], dependencies: ["executor:opencode-executor"], status: "planned" },
+];
+
+/** A mission in the shape get_mission projects (the GUI's missionFromResponse reads it
+ * directly). `state` AWAITING_CONFIRMATION renders the editable plan + the confirm CTA. */
+function makeMission(id: string, title: string, state: string) {
+  const terminal = state === "DONE" || state === "CANCELLED" || state === "APPROVED";
+  return {
+    id,
+    task_id: id,
+    mission_id: id,
+    conversation_id: `conv-${id}`,
+    state,
+    status: state,
+    title,
+    goal: title,
+    workspace: "/Users/test/qh-agent",
+    task_spec: {},
+    plan: {
+      version: 1,
+      status: terminal ? "confirmed" : "proposed",
+      goal: title,
+      members: MISSION_MEMBERS.map((mem) => ({ ...mem })),
+      max_rework_rounds: 2,
+    },
+    members: MISSION_MEMBERS.map((mem) => ({ ...mem })),
+    attempts: [] as any[],
+    artifacts: [] as any[],
+    reviews: [] as any[],
+    messages: [] as any[],
+    timeline: [
+      { event_id: `${id}-ev-1`, cursor: `${id}-ev-1`, event_type: "mission.created", payload: {}, created_at: "2026-08-01T08:00:00Z" },
+      { event_id: `${id}-ev-2`, cursor: `${id}-ev-2`, event_type: "mission.plan_proposed", payload: { members: MISSION_MEMBERS.length }, created_at: "2026-08-01T08:00:05Z" },
+    ],
+    permissions: [] as any[],
+    needs_user_action: state === "AWAITING_CONFIRMATION" || state === "BLOCKED",
+    last_cursor: `${id}-ev-2`,
+    created_at: "2026-08-01T08:00:00Z",
+    updated_at: "2026-08-01T08:00:05Z",
+  };
+}
+
 /** Install the API + WebSocket mocks on a page. Returns handles for assertions/seed data. */
 export async function mockApi(page: import("@playwright/test").Page) {
   const subscriptions: any[] = [
@@ -553,6 +623,37 @@ export async function mockApi(page: import("@playwright/test").Page) {
   // the app reads it back (which is what gates parking approvals to the Inbox vs an inline card).
   const unattended: Record<string, boolean> = {};
 
+  // ACP agent profiles — mutable so upsert/probe/enable/delete round-trip through the Agents page.
+  const agentProfiles: any[] = AGENT_PROFILES.map((p) => ({ ...p, args: [...p.args] }));
+  let mainProfileId: string | null = "kimi-main";
+  // Pending ACP permission requests (the Inbox's PermissionCard section) — empty by default.
+  const agentPermissions: any[] = [];
+  // Missions — one awaiting confirmation (drives the detail page's plan/confirm flow) and one
+  // done (drives the list's filter tabs). Mutable: create/confirm/cancel round-trip.
+  const missions: any[] = [
+    makeMission("m-1", "重写设置页", "AWAITING_CONFIRMATION"),
+    makeMission("m-2", "整理本周周报", "DONE"),
+  ];
+  // Manual token connects (telegram-style connectors without per-kind state) — name → account.
+  const manualConnects: Record<string, string> = {};
+  // Memory items (Settings ▸ 记忆: GET/POST only — the backend has no delete).
+  const memoryItems: any[] = [
+    { id: "mem-1", content: "回复默认使用中文", scope: "workspace", created_at: "2026-07-01 08:00:00" },
+  ];
+  // Models added via Settings ▸ 模型列表. The served list only includes ids whose provider
+  // prefix is configured (backend parity: manager.add_model + get_settings._selectable);
+  // ids with whitespace are rejected, as the backend does.
+  const addedModels: string[] = [];
+  const servedModels = (): string[] => {
+    const configured = new Set(providers.filter((x) => x.configured).map((x) => x.name));
+    const visible = addedModels.filter((id) => {
+      const i = id.indexOf(":");
+      const prefix = i > 0 ? id.slice(0, i) : SETTINGS.provider;
+      return configured.has(prefix);
+    });
+    return [...SETTINGS.models, ...visible.filter((id) => !SETTINGS.models.includes(id))];
+  };
+
   // Fresh cloud sign-in state per test (module state outlives a page).
   Object.assign(CLOUD_STATE, {
     signed_in: false,
@@ -575,9 +676,15 @@ export async function mockApi(page: import("@playwright/test").Page) {
   });
 
   await page.routeWebSocket(/\/ws\/session\//, (ws) => {
+    const urls = sessionSocketsByPage.get(page) ?? [];
+    urls.push(ws.url());
+    sessionSocketsByPage.set(page, urls);
+    // Multi-agent control plane: a bound profile (profile_id=…) is reported back as
+    // ready's `model`, exactly like the real server does on the acp runtime.
+    const profileId = new URL(ws.url()).searchParams.get("profile_id");
     const send = (type: string, data: Record<string, unknown> = {}) =>
       ws.send(JSON.stringify({ type, data }));
-    send("ready");
+    send("ready", profileId ? { model: profileId } : {});
     let pendingTool = "run_shell"; // which proposal the next approval decision resolves
     let epicTimer: ReturnType<typeof setInterval> | null = null; // the slow stream, stoppable via interrupt
     let hadTurn = false; // a user_message landed — set_model is now a mid-session switch
@@ -778,6 +885,20 @@ export async function mockApi(page: import("@playwright/test").Page) {
     });
   });
 
+  // The mission ledger stream (/v1/missions/{id}/events): a quiet socket — no events are
+  // pushed (specs drive state changes through the REST mutations, which the page re-reads),
+  // and pings get their pong so the keepalive contract holds.
+  await page.routeWebSocket(/\/v1\/missions\/[^/]+\/events/, (ws) => {
+    ws.onMessage((raw) => {
+      try {
+        const msg = JSON.parse(String(raw));
+        if (msg?.type === "ping") ws.send(JSON.stringify({ type: "pong" }));
+      } catch {
+        /* malformed frame — ignore */
+      }
+    });
+  });
+
   await page.route("**/v1/**", async (route) => {
     const req = route.request();
     const p = new URL(req.url()).pathname;
@@ -836,8 +957,201 @@ export async function mockApi(page: import("@playwright/test").Page) {
       return json(i >= 0 ? sessions[i] : PINNED_SESSION);
     }
 
+    // -- ACP agent profiles (Agents page + mission detail's plan/team views) -------------
+    // `main` must precede the /:id patterns (it parses as one).
+    if (p.endsWith("/v1/agent-profiles/main")) {
+      if (m === "POST") {
+        const b = req.postDataJSON() || {};
+        mainProfileId = b.profile_id ?? null;
+        return json({ ok: true, workspace: b.workspace ?? null, main_profile_id: mainProfileId });
+      }
+      const prof = agentProfiles.find((x) => x.id === mainProfileId);
+      return prof
+        ? json({ workspace: null, main_profile_id: prof.id, profile: prof })
+        : json({ detail: "no main agent profile for workspace" }, 404);
+    }
+    // PATH detection for the preset cards' install badges: a fixed "installed" set
+    // (npx/opencode/kimi present, gemini/agent/pi missing) so both badge states render.
+    if (p.endsWith("/v1/agent-profiles/detect")) {
+      const INSTALLED = new Set(["npx", "opencode", "kimi"]);
+      const results: Record<string, boolean> = {};
+      for (const c of (new URL(req.url()).searchParams.get("commands") ?? "").split(",").filter(Boolean)) {
+        results[c] = INSTALLED.has(c);
+      }
+      return json({ results });
+    }
+    if (/\/v1\/agent-profiles\/[^/]+\/probe$/.test(p) && m === "POST") {
+      // Live capability probe: slow for real (spawns the runtime); instant here. Records the
+      // fingerprint + capabilities server-side — the row flips to 已探测 and 启用 unlocks.
+      const id = decodeURIComponent(p.split("/").slice(-2)[0]);
+      const prof = agentProfiles.find((x) => x.id === id);
+      if (!prof) return json({ ok: false, error: `unknown agent profile: ${id}` });
+      prof.capabilities = {
+        agentCapabilities: { loadSession: true, promptCapabilities: { image: true } },
+        agentInfo: { name: prof.command || "agent", version: "1.0" },
+      };
+      prof.capability_probe_fingerprint = `fp-${id}`;
+      return json({ ok: true, profile: prof, capabilities: prof.capabilities });
+    }
+    if (/\/v1\/agent-profiles\/[^/]+$/.test(p) && m === "DELETE") {
+      const id = decodeURIComponent(p.split("/").pop()!);
+      const i = agentProfiles.findIndex((x) => x.id === id);
+      if (i >= 0) agentProfiles.splice(i, 1);
+      if (mainProfileId === id) mainProfileId = null;
+      return json({ ok: i >= 0, deleted: i >= 0, profile_id: id });
+    }
+    if (p.endsWith("/v1/agent-profiles")) {
+      if (m === "POST") {
+        // Upsert by id (backend parity: an identity change would clear the stored probe —
+        // the GUI always saves disabled anyway, so honoring the body's flags is enough).
+        const b = req.postDataJSON() || {};
+        const i = agentProfiles.findIndex((x) => x.id === b.id);
+        if (i >= 0) agentProfiles[i] = { ...agentProfiles[i], ...b };
+        else agentProfiles.push({ ...b });
+        return json({ ok: true, profile: agentProfiles.find((x) => x.id === b.id) });
+      }
+      return json({ profiles: agentProfiles });
+    }
+
+    // ACP permission requests (Inbox's PermissionCard section) — empty unless seeded.
+    if (p.endsWith("/v1/agent-permissions")) {
+      const q = new URL(req.url()).searchParams;
+      const pendingOnly = q.get("pending_only") !== "false";
+      return json({
+        permissions: agentPermissions.filter((x) => !pendingOnly || x.state === "pending"),
+      });
+    }
+    if (/\/v1\/agent-permissions\/[^/]+$/.test(p) && m === "POST") {
+      const id = decodeURIComponent(p.split("/").pop()!);
+      const i = agentPermissions.findIndex((x) => x.permission_id === id);
+      if (i >= 0) agentPermissions.splice(i, 1);
+      return json({ ok: i >= 0 });
+    }
+
+    // -- missions (structured multi-agent runs) -------------------------------------------
+    if (p.endsWith("/v1/missions")) {
+      if (m === "POST") {
+        const b = req.postDataJSON() || {};
+        const goal = String(b.goal ?? b.task_spec?.prompt ?? "").trim();
+        if (!goal) return json({ ok: false, error: "missing goal" });
+        const id = `m-${missions.length + 1}`;
+        const mission = makeMission(id, String(b.title || goal).slice(0, 80) || goal, "AWAITING_CONFIRMATION");
+        mission.goal = goal;
+        mission.plan.goal = goal;
+        missions.unshift(mission);
+        return json(mission);
+      }
+      return json({ missions });
+    }
+    if (/\/v1\/missions\/[^/]+\/plan$/.test(p) && m === "PATCH") {
+      const id = decodeURIComponent(p.split("/").slice(-2)[0]);
+      const mission = missions.find((x) => x.mission_id === id);
+      if (!mission) return json({ detail: `unknown mission: ${id}` }, 404);
+      const plan = req.postDataJSON()?.plan ?? {};
+      mission.plan = { ...mission.plan, ...plan, version: (mission.plan.version ?? 1) + 1, status: "proposed" };
+      mission.members = Array.isArray(plan.members) ? plan.members : mission.members;
+      mission.updated_at = "2026-08-01T08:05:00Z";
+      return json(mission);
+    }
+    if (/\/v1\/missions\/[^/]+\/confirm$/.test(p) && m === "POST") {
+      const id = decodeURIComponent(p.split("/").slice(-2)[0]);
+      const mission = missions.find((x) => x.mission_id === id);
+      if (!mission) return json({ detail: `unknown mission: ${id}` }, 404);
+      // Backend parity: confirmation spawns the executor attempt and queues the mission.
+      mission.state = "QUEUED";
+      mission.status = "QUEUED";
+      mission.needs_user_action = false;
+      mission.plan.status = "confirmed";
+      mission.attempts = [
+        { id: `${id}-attempt-1`, task_id: id, agent_profile_id: "opencode-executor", role: "executor", status: "QUEUED" },
+      ];
+      mission.members = mission.members.map((mem: any) =>
+        mem.role === "executor" ? { ...mem, attempt_id: `${id}-attempt-1`, status: "queued" } : mem,
+      );
+      mission.updated_at = "2026-08-01T08:06:00Z";
+      return json(mission);
+    }
+    if (/\/v1\/missions\/[^/]+\/messages$/.test(p) && m === "POST") {
+      const id = decodeURIComponent(p.split("/").slice(-2)[0]);
+      if (!missions.some((x) => x.mission_id === id)) return json({ detail: `unknown mission: ${id}` }, 404);
+      return json({ ok: true, mission_id: id, message_id: `${id}-msg-1`, newly_enqueued: true, delivered: true });
+    }
+    if (/\/v1\/missions\/[^/]+\/cancel$/.test(p) && m === "POST") {
+      const id = decodeURIComponent(p.split("/").slice(-2)[0]);
+      const mission = missions.find((x) => x.mission_id === id);
+      if (!mission) return json({ detail: `unknown mission: ${id}` }, 404);
+      mission.state = "CANCELLED";
+      mission.status = "CANCELLED";
+      mission.needs_user_action = false;
+      mission.updated_at = "2026-08-01T08:07:00Z";
+      return json(mission);
+    }
+    // REST fallback page of the ledger stream (the GUI primarily rides the WS above).
+    if (/\/v1\/missions\/[^/]+\/events$/.test(p)) return json({ events: [], next_cursor: null });
+    if (/\/v1\/missions\/[^/]+$/.test(p)) {
+      const id = decodeURIComponent(p.split("/").pop()!);
+      const mission = missions.find((x) => x.mission_id === id);
+      return mission ? json(mission) : json({ detail: `unknown mission: ${id}` }, 404);
+    }
+
+    // Memory (Settings ▸ 记忆) — GET/POST only; the backend has no delete.
+    if (p.endsWith("/v1/memory")) {
+      if (m === "POST") {
+        const b = req.postDataJSON() || {};
+        memoryItems.unshift({
+          id: `mem-${memoryItems.length + 1}`,
+          content: String(b.content ?? ""),
+          scope: String(b.scope ?? "workspace"),
+          created_at: "2026-08-01 09:00:00",
+        });
+        return json({ ok: true });
+      }
+      return json({ memory: memoryItems });
+    }
+
+    // Integrations extras: the audit log, web-search settings, DM routing, inbox reconcile.
+    if (p.endsWith("/v1/audit")) return json({ events: [] });
+    if (p.endsWith("/v1/web-search")) {
+      if (m === "POST") return json({ ok: true });
+      return json({ provider: "", has_key: false, providers: [] });
+    }
+    if (p.endsWith("/v1/messaging/dm-route")) {
+      if (m === "POST") return json({ ok: true });
+      return json({ dm_session: null });
+    }
+    if (p.endsWith("/v1/inbox/reconcile")) return json({ items: [], unresolved: [] });
+
+    // Manual token connect / disconnect for connectors without per-kind state (telegram et
+    // al.) — flips `connected`/`account` on the next GET, like the backend's set_connector.
+    if (/\/v1\/connectors\/[^/]+\/connect$/.test(p) && m === "POST") {
+      const name = decodeURIComponent(p.split("/").slice(-2)[0]);
+      const c = CONNECTORS.connectors.find((x: any) => x.name === name);
+      if (!c) return json({ ok: false, error: `unknown connector: ${name}` });
+      manualConnects[name] = `${name}-acct`;
+      return json({ ok: true, account: manualConnects[name] });
+    }
+    if (/\/v1\/connectors\/[^/]+\/disconnect$/.test(p) && m === "POST") {
+      const name = decodeURIComponent(p.split("/").slice(-2)[0]);
+      delete manualConnects[name];
+      return json({ ok: true });
+    }
+
     if (p.endsWith("/v1/health")) return json(HEALTH);
-    if (p.endsWith("/v1/settings")) return json(SETTINGS);
+    if (p.endsWith("/v1/settings/models/add") && m === "POST") {
+      const id = String(req.postDataJSON()?.model || "").trim();
+      if (!id || /\s/.test(id)) {
+        return json({ ok: false, error: "model id must not contain whitespace" });
+      }
+      if (!addedModels.includes(id)) addedModels.push(id);
+      return json({ ...SETTINGS, ok: true, models: servedModels() });
+    }
+    if (p.endsWith("/v1/settings/models/remove") && m === "POST") {
+      const id = String(req.postDataJSON()?.model || "");
+      const i = addedModels.indexOf(id);
+      if (i >= 0) addedModels.splice(i, 1);
+      return json({ ...SETTINGS, ok: true, models: servedModels() });
+    }
+    if (p.endsWith("/v1/settings")) return json({ ...SETTINGS, models: servedModels() });
     if (p.endsWith("/v1/settings/context-bar") && m === "POST") {
       Object.assign(SETTINGS, req.postDataJSON());
       return json({ ok: true, context_bar: SETTINGS.context_bar });
@@ -1157,7 +1471,13 @@ export async function mockApi(page: import("@playwright/test").Page) {
                       ? outlookConnector()
                       : c.name === "monday" || c.name === "jira"
                         ? mcpConnector(c.name)
-                        : { ...c },
+                        : {
+                            ...c,
+                            // Manual token connects (telegram) flip the flag via manualConnects.
+                            connected: c.connected || c.name in manualConnects,
+                            enabled: c.enabled || c.name in manualConnects,
+                            account: manualConnects[c.name] ?? c.account,
+                          },
           ),
         ],
       });

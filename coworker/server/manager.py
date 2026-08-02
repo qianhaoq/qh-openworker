@@ -8,17 +8,29 @@ sessions span folders.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
 import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
+import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
 from ..agent import build_engine
+from ..acp import (
+    AcpAgentAdapter,
+    AcpMcpServer,
+    PermissionRequest,
+    PiJsonlRpcAdapter,
+)
+from ..acp.process_env import build_minimal_env
 from ..agents import get_agent
 from ..connections import (
     PersonaConnectionStore,
@@ -69,8 +81,16 @@ from ..mcp import (
     put_global_server,
     read_global,
 )
+from ..main_acp import MainAcpHost
 from ..memory import MemoryStore, Scope, SQLiteMemoryStore
+from ..orchestration import (
+    AgentProfile,
+    AgentRole,
+    Transport,
+    WorktreeManager,
+)
 from ..permissions import Mode
+from ..orchestrator import QhOrchestratorStore
 from ..agents import list_agents as _list_agents
 from ..providers import (
     ProviderClient,
@@ -133,6 +153,33 @@ class SessionManager:
         self.memory_store: MemoryStore = SQLiteMemoryStore(base / "coworker.db")
         self.audit_store = AuditStore(base / "coworker.db")
         self.session_store = ConversationStore(base)
+        self.orchestrator = QhOrchestratorStore(base / "qh_orchestrator.db")
+        # Profiles and task state intentionally share one SQLite/ledger store.
+        self.agent_profiles = self.orchestrator
+        self.acp_adapter = AcpAgentAdapter(
+            update_sink=self._handle_acp_update,
+            permission_resolver=self._resolve_agent_permission,
+        )
+        self.pi_adapter = PiJsonlRpcAdapter(update_sink=self._handle_acp_update)
+        self.main_acp_host = MainAcpHost(
+            orchestrator=self.orchestrator,
+            conversations=self.session_store,
+            memory=self.memory_store,
+            acp_adapter=self.acp_adapter,
+            pi_adapter=self.pi_adapter,
+            mcp_servers_factory=self._main_acp_mcp_servers,
+            update_sink=self._handle_main_acp_update,
+        )
+        self.worktrees = WorktreeManager(
+            self.orchestrator.store,
+            worktree_root=state_dir() / "worktrees",
+        )
+        self._team_active: dict[str, dict[str, Any]] = {}
+        self._team_jobs: dict[str, asyncio.Task[None]] = {}
+        self._agent_permission_waiters: dict[str, asyncio.Future[Optional[str]]] = {}
+        self._agent_permission_requests: dict[str, dict[str, Any]] = {}
+        self._team_worker_task: Optional[asyncio.Task[None]] = None
+        self._team_worker_interval = 1.0
         self.session_store.canonicalize_workspaces()  # collapse /tmp vs /private/tmp etc.
         if self.default_workspace:
             self.session_store.touch_workspace(self.default_workspace)
@@ -960,6 +1007,7 @@ class SessionManager:
                         fn.__aisuite_tool_metadata__.name, default=True
                     )
             out.extend(callables)
+
         return out
 
     def list_mcp(self) -> list[dict[str, Any]]:
@@ -1106,6 +1154,20 @@ class SessionManager:
             if server.name == name:
                 try:
                     conn = await self.mcp.ensure(server)
+                except (FileNotFoundError, PermissionError) as exc:
+                    # Spawning the stdio command failed before any MCP traffic — say
+                    # WHICH command and why instead of leaking a raw errno.
+                    reason = (
+                        "not found"
+                        if isinstance(exc, FileNotFoundError)
+                        else "not executable"
+                    )
+                    target = (
+                        f"MCP server command {reason}: {server.command}"
+                        if server.command
+                        else f"MCP server command {reason}"
+                    )
+                    return {"name": name, "ok": False, "error": target, "tools": []}
                 except Exception as exc:
                     return {"name": name, "ok": False, "error": str(exc), "tools": []}
                 return {
@@ -1656,6 +1718,2204 @@ class SessionManager:
             json.dumps(self._prefs, indent=2), encoding="utf-8"
         )
 
+    # -- QH ACP / multi-agent control plane ------------------------------------
+    def list_agent_profiles(self) -> dict[str, Any]:
+        return {"profiles": [p.to_dict() for p in self.agent_profiles.list()]}
+
+    def upsert_agent_profile(self, payload: dict[str, Any]) -> dict[str, Any]:
+        profile = AgentProfile.from_dict(payload or {})
+        saved = self.agent_profiles.put(profile)
+        return {"ok": True, "profile": saved.to_dict()}
+
+    def delete_agent_profile(self, profile_id: str) -> dict[str, Any]:
+        deleted = self.agent_profiles.delete(profile_id)
+        if not deleted:
+            raise KeyError(profile_id)
+        return {"ok": True, "profile_id": profile_id, "deleted": True}
+
+    def get_workspace_main_agent(self, workspace: str | Path | None = None) -> dict[str, Any]:
+        ws = workspace or self.default_workspace or os.getcwd()
+        profile = self.agent_profiles.get_workspace_main(ws)
+        return {
+            "workspace": str(Path(ws).expanduser().resolve()),
+            "main_profile_id": profile.id,
+            "profile": profile.to_dict(),
+        }
+
+    def set_workspace_main_agent(
+        self, workspace: str | Path | None, profile_id: str
+    ) -> dict[str, Any]:
+        ws = workspace or self.default_workspace or os.getcwd()
+        return {"ok": True, **self.agent_profiles.set_workspace_main(ws, profile_id)}
+
+    def _agent_adapter(self, profile: AgentProfile) -> Any:
+        if profile.transport == Transport.ACP_STDIO:
+            return self.acp_adapter
+        if profile.transport == Transport.JSONL_RPC:
+            return self.pi_adapter
+        raise ValueError(f"unsupported agent transport: {profile.transport.value}")
+
+    async def probe_agent_profile(
+        self, profile_id: str, workspace: str | Path | None = None
+    ) -> dict[str, Any]:
+        profile = self.agent_profiles.get(profile_id)
+        if profile is None:
+            raise KeyError(profile_id)
+        cwd = str(
+            Path(workspace or self.default_workspace or os.getcwd())
+            .expanduser()
+            .resolve()
+        )
+        adapter = self._agent_adapter(profile)
+        if profile.transport == Transport.ACP_STDIO:
+            capabilities = await adapter.probe(profile, cwd=cwd)
+        else:
+            handle = await adapter.open_session(profile, cwd=cwd)
+            try:
+                capabilities = {
+                    "transport": "jsonl_rpc",
+                    "state": await adapter.get_state(handle),
+                }
+            finally:
+                await adapter.close(handle)
+        saved = self.agent_profiles.save_capabilities(profile.id, capabilities)
+        return {"ok": True, "profile": saved.to_dict(), "capabilities": capabilities}
+
+    async def _resolve_agent_permission(
+        self, request: PermissionRequest
+    ) -> Optional[str]:
+        permission_id = "agent_permission_" + uuid.uuid4().hex
+        item = {
+            "permission_id": permission_id,
+            "profile_id": request.profile_id,
+            "role": request.role,
+            "session_id": request.session_id,
+            "tool_call": request.tool_call,
+            "options": list(request.options),
+            "status": "pending",
+            "created_at": time.time(),
+        }
+        loop = asyncio.get_running_loop()
+        waiter: asyncio.Future[Optional[str]] = loop.create_future()
+        self._agent_permission_requests[permission_id] = item
+        self._agent_permission_waiters[permission_id] = waiter
+        self.orchestrator.store.append_event(
+            {
+                "event_id": permission_id,
+                "event_type": "agent.permission.requested",
+                "aggregate_type": "agent_session",
+                "aggregate_id": request.session_id,
+                "payload": item,
+            }
+        )
+        session = self.orchestrator.store.get_agent_session(request.session_id)
+        if session and session.get("task_id"):
+            self.orchestrator.store.append_event(
+                {
+                    "event_id": f"{permission_id}:mission",
+                    "event_type": "permission.required",
+                    "aggregate_type": "task",
+                    "aggregate_id": str(session["task_id"]),
+                    "payload": item,
+                }
+            )
+        await self.broadcast_event({"type": "agent_permission", "data": item})
+        try:
+            selected = await asyncio.wait_for(waiter, timeout=900)
+            item["status"] = "resolved" if selected else "denied"
+            item["selected_option_id"] = selected
+            return selected
+        except asyncio.TimeoutError:
+            item["status"] = "expired"
+            return None
+        finally:
+            self._agent_permission_waiters.pop(permission_id, None)
+            self.orchestrator.store.append_event(
+                {
+                    "event_id": f"{permission_id}:resolved",
+                    "event_type": "agent.permission.resolved",
+                    "aggregate_type": "agent_session",
+                    "aggregate_id": request.session_id,
+                    "payload": {
+                        "permission_id": permission_id,
+                        "status": item["status"],
+                        "selected_option_id": item.get("selected_option_id"),
+                    },
+                }
+            )
+            session = self.orchestrator.store.get_agent_session(request.session_id)
+            if session and session.get("task_id"):
+                self.orchestrator.store.append_event(
+                    {
+                        "event_id": f"{permission_id}:mission:resolved",
+                        "event_type": "permission.resolved",
+                        "aggregate_type": "task",
+                        "aggregate_id": str(session["task_id"]),
+                        "payload": {
+                            "permission_id": permission_id,
+                            "status": item["status"],
+                            "selected_option_id": item.get("selected_option_id"),
+                        },
+                    }
+                )
+
+    def list_agent_permissions(self, *, pending_only: bool = True) -> dict[str, Any]:
+        requests = list(self._agent_permission_requests.values())
+        if pending_only:
+            requests = [item for item in requests if item.get("status") == "pending"]
+        return {"permissions": sorted(requests, key=lambda item: item["created_at"])}
+
+    async def resolve_agent_permission(
+        self, permission_id: str, option_id: Optional[str]
+    ) -> dict[str, Any]:
+        item = self._agent_permission_requests.get(permission_id)
+        if item is None:
+            raise KeyError(permission_id)
+        if item.get("status") != "pending":
+            return {"ok": True, "permission": item}
+        selected = str(option_id or "").strip() or None
+        valid_ids = {
+            str(option.get("optionId") or option.get("option_id") or "")
+            for option in item.get("options") or []
+        }
+        if selected is not None and selected not in valid_ids:
+            raise ValueError("unknown permission option")
+        waiter = self._agent_permission_waiters.get(permission_id)
+        if waiter is None or waiter.done():
+            item["status"] = "expired"
+        else:
+            waiter.set_result(selected)
+        return {"ok": True, "permission": item}
+
+    def delegate_agent_task(self, payload: dict[str, Any]) -> dict[str, Any]:
+        body = payload or {}
+        task_spec = body.get("task_spec") or body
+        return self.orchestrator.delegate(
+            task_spec,
+            conversation_id=body.get("conversation_id"),
+            target_profile_id=body.get("target_profile_id"),
+            max_rework_rounds=body.get(
+                "max_rework_rounds", QhOrchestratorStore.DEFAULT_MAX_REWORK_ROUNDS
+            ),
+        )
+
+    def create_mission(self, payload: dict[str, Any]) -> dict[str, Any]:
+        body = dict(payload or {})
+        spec = body.get("task_spec") if isinstance(body.get("task_spec"), dict) else {}
+        workspace = body.get("workspace") or spec.get("workspace") or self.default_workspace
+        main_profile_id: Optional[str] = None
+        if workspace:
+            main_profile_id = self.agent_profiles.get_workspace_main(workspace).id
+        return self.orchestrator.create_mission(
+            body,
+            main_profile_id=main_profile_id,
+        )
+
+    async def create_mission_with_main_planning(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Create a Mission and obtain its first structured plan from the main ACP Agent.
+
+        A provider/runtime failure falls back to the control-plane template, but the
+        persisted event and projection name that fallback explicitly.  Neither branch
+        starts an attempt; confirmation remains the only path to ``QUEUED``.
+        """
+
+        body = dict(payload or {})
+        spec = body.get("task_spec") if isinstance(body.get("task_spec"), dict) else {}
+        workspace_value = body.get("workspace") or spec.get("workspace") or self.default_workspace
+        workspace = str(Path(workspace_value).expanduser().resolve()) if workspace_value else None
+        main_profile_id: Optional[str] = None
+        if workspace:
+            main_profile_id = self.agent_profiles.get_workspace_main(workspace).id
+        draft = self.orchestrator.create_mission(
+            body,
+            main_profile_id=main_profile_id,
+            defer_plan_proposal=True,
+        )
+        if str(draft.get("state")) != "PLANNING":
+            return draft
+        mission_id = str(draft["mission_id"])
+        draft_plan = dict(draft.get("plan") or {})
+        planning_mode = str(body.get("planning_mode") or "main_agent").strip()
+        if planning_mode != "main_agent" or not workspace:
+            reason = (
+                "main_agent_planning_disabled"
+                if planning_mode != "main_agent"
+                else "workspace_required_for_main_agent"
+            )
+            return self.orchestrator.propose_mission_plan(
+                mission_id,
+                draft_plan,
+                source="control_plane_fallback",
+                fallback_reason=reason,
+            )
+
+        profiles = [
+            {
+                "id": profile.id,
+                "role": profile.role.value,
+                "transport": profile.transport.value,
+                "permission_policy": profile.permission_policy,
+            }
+            for profile in self.agent_profiles.list()
+            if profile.enabled
+        ]
+        planning_prompt = self._mission_planning_prompt(
+            mission_id=mission_id,
+            goal=str(draft.get("goal") or ""),
+            profiles=profiles,
+            fallback_plan=draft_plan,
+        )
+        try:
+            main_profile = self.agent_profiles.get(str(main_profile_id or ""))
+            if main_profile is None:
+                raise ValueError("workspace main Agent profile is unavailable")
+            turn, planning_session_id = await self._run_main_mission_planning_turn(
+                profile=main_profile,
+                workspace=workspace,
+                conversation_id=str(draft["conversation_id"]),
+                mission_id=mission_id,
+                prompt=planning_prompt,
+            )
+            proposed = self._parse_main_mission_plan(turn.text)
+            return self.orchestrator.propose_mission_plan(
+                mission_id,
+                proposed,
+                source="main_agent",
+                agent_session_id=planning_session_id,
+            )
+        except Exception as exc:
+            reason = type(exc).__name__
+            logger.warning(
+                "main ACP planning failed for mission %s; using explicit fallback (%s)",
+                mission_id,
+                reason,
+            )
+            return self.orchestrator.propose_mission_plan(
+                mission_id,
+                draft_plan,
+                source="control_plane_fallback",
+                fallback_reason=reason,
+            )
+
+    async def _run_main_mission_planning_turn(
+        self,
+        *,
+        profile: AgentProfile,
+        workspace: str,
+        conversation_id: str,
+        mission_id: str,
+        prompt: str,
+    ) -> tuple[Any, str]:
+        """Run one isolated, read-only main-Agent planning session.
+
+        This deliberately bypasses ``MainAcpHost`` because normal main sessions receive
+        the qh-team MCP server, whose delegate tool can create durable work before the
+        user confirms a plan.  The planning clone has no MCP servers and its permission
+        policy is forced to read-only.
+        """
+
+        planning_profile_data = profile.to_dict()
+        planning_profile_data.update(
+            {
+                "workspace_policy": "readonly",
+                "permission_policy": "read-only",
+                "enabled": True,
+                "capabilities": {},
+                "capability_probe_fingerprint": None,
+            }
+        )
+        planning_profile = AgentProfile.from_dict(planning_profile_data)
+        adapter: Any
+        if planning_profile.transport == Transport.ACP_STDIO:
+            adapter = self.acp_adapter
+            handle = await adapter.open_session(
+                planning_profile,
+                cwd=workspace,
+                checkpoint={
+                    "mission_id": mission_id,
+                    "mode": "plan-only",
+                    "read_only": True,
+                },
+                mcp_servers=(),
+            )
+        elif planning_profile.transport == Transport.JSONL_RPC:
+            adapter = self.pi_adapter
+            handle = await adapter.open_session(planning_profile, cwd=workspace)
+        else:
+            raise ValueError(
+                f"unsupported main planning transport: {planning_profile.transport.value}"
+            )
+        try:
+            self.orchestrator.save_agent_session(
+                session_id=handle.session_id,
+                conversation_id=conversation_id,
+                profile_id=profile.id,
+                task_id=mission_id,
+                status="planning",
+                capabilities=handle.capabilities,
+                metadata={
+                    "workspace": workspace,
+                    "role": "main",
+                    "mode": "plan-only",
+                    "read_only": True,
+                    "mcp_servers": [],
+                },
+            )
+            result = await adapter.prompt(handle, prompt)
+            return result, handle.session_id
+        finally:
+            with contextlib.suppress(Exception):
+                await adapter.close(handle)
+            with contextlib.suppress(Exception):
+                self.orchestrator.save_agent_session(
+                    session_id=handle.session_id,
+                    conversation_id=conversation_id,
+                    profile_id=profile.id,
+                    task_id=mission_id,
+                    status="closed",
+                    capabilities=handle.capabilities,
+                    metadata={
+                        "workspace": workspace,
+                        "role": "main",
+                        "mode": "plan-only",
+                        "read_only": True,
+                        "mcp_servers": [],
+                    },
+                )
+
+    @staticmethod
+    def _mission_planning_prompt(
+        *,
+        mission_id: str,
+        goal: str,
+        profiles: list[dict[str, Any]],
+        fallback_plan: dict[str, Any],
+    ) -> str:
+        schema = {
+            "goal": "string",
+            "members": [
+                {
+                    "id": "role:profile-id",
+                    "role": "main|explorer|executor|reviewer|gui",
+                    "profile_id": "one enabled profile id from roster",
+                    "objective": "specific responsibility",
+                    "depends_on": ["member id"],
+                }
+            ],
+            "max_rework_rounds": 2,
+        }
+        return "\n\n".join(
+            [
+                "You are the main Agent planning a QH Assistant Mission. Return exactly one JSON object and no Markdown.",
+                "Use only enabled profile ids from the roster. Include main, executor, and read-only reviewer; add explorer and GUI when useful. Dependencies must reference member ids. Do not execute tools or modify files in this planning turn.",
+                json.dumps(
+                    {
+                        "mission_id": mission_id,
+                        "goal": goal,
+                        "schema": schema,
+                        "enabled_profiles": profiles,
+                        "safe_fallback": fallback_plan,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            ]
+        )
+
+    @staticmethod
+    def _parse_main_mission_plan(text: str) -> dict[str, Any]:
+        raw = str(text or "").strip()
+        if not raw:
+            raise ValueError("main Agent returned an empty Mission plan")
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw, count=1, flags=re.IGNORECASE)
+            raw = re.sub(r"\s*```$", "", raw, count=1)
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            start = raw.find("{")
+            end = raw.rfind("}")
+            if start < 0 or end <= start:
+                raise ValueError("main Agent Mission plan is not a JSON object")
+            payload = json.loads(raw[start : end + 1])
+        if isinstance(payload, dict) and isinstance(payload.get("plan"), dict):
+            payload = payload["plan"]
+        if not isinstance(payload, dict):
+            raise ValueError("main Agent Mission plan must be a JSON object")
+        allowed = {"goal", "members", "team", "max_rework_rounds"}
+        return {key: value for key, value in payload.items() if key in allowed}
+
+    def list_missions(self, states: Optional[list[str]] = None) -> dict[str, Any]:
+        return {"missions": self.orchestrator.list_missions(states)}
+
+    def get_mission(self, mission_id: str) -> dict[str, Any]:
+        return self.orchestrator.get_mission(mission_id)
+
+    def update_mission_plan(
+        self, mission_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self.orchestrator.update_mission_plan(mission_id, payload or {})
+
+    def confirm_mission(
+        self, mission_id: str, payload: Optional[dict[str, Any]] = None
+    ) -> dict[str, Any]:
+        body = payload or {}
+        return self.orchestrator.confirm_mission(
+            mission_id,
+            idempotency_key=body.get("idempotency_key"),
+        )
+
+    def message_mission(self, mission_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        body = payload or {}
+        target = body.get("target")
+        if not isinstance(target, dict):
+            raise ValueError("mission message target is required")
+        return self.orchestrator.message_mission(
+            mission_id,
+            str(body.get("message") or ""),
+            target=target,
+            idempotency_key=body.get("idempotency_key"),
+        )
+
+    async def message_mission_with_delivery(
+        self, mission_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Queue a Mission message and deliver attempt targets to a real ACP session."""
+
+        body = payload or {}
+        target = body.get("target") if isinstance(body.get("target"), dict) else {}
+        if str(target.get("kind") or "") == "attempt":
+            attempt_id = str(target.get("attempt_id") or "").strip()
+            attempt = self.orchestrator.store.get_attempt(attempt_id)
+            if attempt is None or attempt.task_id != mission_id:
+                raise OrchestrationStoreError(
+                    "message target attempt does not belong to mission"
+                )
+            task = self.orchestrator.store.get_task(mission_id)
+            if task is None:
+                raise KeyError(mission_id)
+            if attempt.role == AgentRole.EXECUTOR and task.status.value not in {
+                "IMPLEMENTING",
+                "REWORK",
+                "DONE",
+                "BLOCKED",
+            }:
+                raise OrchestrationStoreError(
+                    f"executor follow-up is unavailable while mission is {task.status.value}"
+                )
+
+        result = self.message_mission(mission_id, body)
+        if str(target.get("kind") or "") != "attempt" or not result.get("newly_enqueued"):
+            return result
+        attempt_id = str(target.get("attempt_id") or "")
+        attempt = self.orchestrator.store.get_attempt(attempt_id)
+        if attempt is None:
+            raise OrchestrationStoreError("message target attempt disappeared")
+        if attempt.role == AgentRole.EXECUTOR:
+            active = self._team_active.get(mission_id)
+            if active and str((active.get("attempt") or {}).get("attempt_id") or "") == attempt_id:
+                await self._deliver_pending_task_messages(self.agent_task_result(mission_id))
+                result["delivered"] = not any(
+                    item.get("message_id") == result.get("message_id")
+                    for item in self.orchestrator.pending_messages(mission_id)
+                )
+            else:
+                result["delivery_state"] = "queued_for_executor"
+            return result
+
+        delivered = await self._deliver_attempt_target_messages(mission_id, attempt_id)
+        result["delivered"] = str(result.get("message_id") or "") in delivered
+        return result
+
+    def mission_events(
+        self,
+        mission_id: str,
+        *,
+        after_cursor: Optional[str] = None,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        return self.orchestrator.mission_events(
+            mission_id,
+            after_cursor=after_cursor,
+            limit=limit,
+        )
+
+    def cancel_mission(self, mission_id: str) -> dict[str, Any]:
+        self.cancel_agent_task(mission_id)
+        return self.orchestrator.get_mission(mission_id)
+
+    def agent_task_status(self, task_id: str) -> dict[str, Any]:
+        return self.orchestrator.status(task_id)
+
+    def agent_task_result(self, task_id: str) -> dict[str, Any]:
+        return self.orchestrator.result(task_id)
+
+    def message_agent_task(
+        self,
+        task_id: str,
+        message: str,
+        *,
+        idempotency_key: Optional[str] = None,
+    ) -> dict[str, Any]:
+        return self.orchestrator.message(
+            task_id,
+            message,
+            idempotency_key=idempotency_key,
+        )
+
+    def cancel_agent_task(self, task_id: str) -> dict[str, Any]:
+        result = self.orchestrator.cancel(task_id)
+        job = self._team_jobs.get(task_id)
+        if job is not None and not job.done():
+            job.cancel()
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(
+                self._close_team_runtime(
+                    task_id,
+                    cancel=True,
+                    final_attempt_status="cancelled",
+                )
+            )
+        except RuntimeError:
+            pass
+        return result
+
+    def start_agent_attempt(self, task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        body = payload or {}
+        return self.orchestrator.start_attempt(
+            task_id,
+            profile_id=str(body.get("profile_id") or "opencode-executor"),
+            role=str(body.get("role") or "executor"),
+            agent_session_id=body.get("agent_session_id"),
+            worktree_path=body.get("worktree_path"),
+            rework_round=int(body.get("rework_round", 0)),
+        )
+
+    def add_agent_artifact(self, task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        body = payload or {}
+        return self.orchestrator.add_artifact(
+            task_id,
+            kind=str(body.get("kind") or "artifact"),
+            attempt_id=body.get("attempt_id"),
+            path=body.get("path"),
+            payload=body.get("payload") or {},
+        )
+
+    def request_agent_review(self, artifact_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.orchestrator.request_review(
+            artifact_id,
+            reviewer_profile_id=(payload or {}).get("reviewer_profile_id"),
+        )
+
+    def record_agent_review(self, task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        body = payload or {}
+        return self.orchestrator.record_review(
+            task_id,
+            str(body.get("artifact_id") or ""),
+            body.get("result") or body,
+            reviewer_profile_id=body.get("reviewer_profile_id"),
+            reviewer_attempt_id=body.get("reviewer_attempt_id"),
+            tests_passed=bool(body.get("tests_passed", True)),
+        )
+
+    def _team_tools(self, session_id: str) -> list[Any]:
+        # Kept as a compatibility hook for older personas. New coding agents receive
+        # these operations through the qh Team MCP server at ACP session setup.
+        return []
+
+    def enqueue_agent_delivery(self, payload: dict[str, Any]) -> dict[str, Any]:
+        body = payload or {}
+        return self.orchestrator.enqueue_main_delivery(
+            conversation_id=body.get("conversation_id"),
+            target_session_id=body.get("target_session_id"),
+            source_task_id=str(body.get("source_task_id") or body.get("task_id") or ""),
+            payload=body.get("payload") or {},
+            delivery_id=body.get("delivery_id"),
+        )
+
+    def pending_agent_deliveries(self, target_session_id: str) -> dict[str, Any]:
+        return {
+            "deliveries": self.orchestrator.pending_deliveries(target_session_id)
+        }
+
+    def mark_agent_delivery_delivered(self, delivery_id: str) -> dict[str, Any]:
+        return self.orchestrator.mark_delivered(delivery_id)
+
+    async def _drain_team_deliveries(self, max_items: int = 20) -> int:
+        pending = self.orchestrator.pending_deliveries()[:max_items]
+        delivered = 0
+        for item in pending:
+            target_session_id = item.get("target_session_id")
+            if not target_session_id:
+                self.orchestrator.mark_delivered(item["delivery_id"])
+                continue
+            payload = item.get("payload")
+            if isinstance(payload, dict):
+                task_id = item.get("source_task_id")
+                header = f"[team-task:{task_id}]" if task_id else "[team-task]"
+                body = payload.get("summary") or json.dumps(payload, ensure_ascii=False)
+                message = f"{header} {body}".strip()
+            else:
+                message = str(payload)
+            if message:
+                try:
+                    delivery_result = await self.deliver_to_session(
+                        target_session_id,
+                        message,
+                        source={"kind": "team", "task_id": item.get("source_task_id")},
+                        # The host and control-plane share one ledger table, so keep their
+                        # idempotency keys stable but in separate namespaces.
+                        delivery_id=f"main_session:{item['delivery_id']}",
+                        raise_on_error=True,
+                    )
+                    if not delivery_result or not delivery_result.get("delivered"):
+                        logger.warning(
+                            "team delivery %s remains pending: main ACP outcome is %s",
+                            item.get("delivery_id"),
+                            (delivery_result or {}).get("state", "unconfirmed"),
+                        )
+                        continue
+                except Exception as exc:
+                    logger.warning(
+                        "team delivery %s remains pending: %s",
+                        item.get("delivery_id"),
+                        exc,
+                    )
+                    continue
+            self.orchestrator.mark_delivered(item["delivery_id"])
+            delivered += 1
+        return delivered
+
+    def _team_mcp_servers(
+        self,
+        *,
+        role: str,
+        conversation_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> list[AcpMcpServer]:
+        """Return the host-controlled Team MCP server for the main Agent only.
+
+        Specialists receive an explicit task/context package from the orchestrator and must
+        not recursively delegate or form a peer mesh.  Reviewers therefore remain read-only,
+        and executors/explorers do not receive Team MCP mutation tools.
+        """
+        if role != "main":
+            return []
+        try:
+            from .. import team_mcp as module  # type: ignore[attr-defined]
+        except Exception:
+            return []
+        factory = getattr(module, "build_team_mcp_server", None)
+        servers = (
+            factory(
+                db_path=self._data_base / "qh_orchestrator.db",
+                conversation_id=conversation_id,
+                session_id=session_id,
+                role=role,
+            )
+            if callable(factory)
+            else getattr(module, "TEAM_MCP_SERVER", [])
+        )
+        if servers is None:
+            return []
+        if isinstance(servers, AcpMcpServer):
+            return [servers]
+        return [server for server in list(servers) if isinstance(server, AcpMcpServer)]
+
+    def _main_acp_mcp_servers(
+        self, profile: AgentProfile, conversation_id: str, _workspace: str
+    ) -> list[AcpMcpServer]:
+        return self._team_mcp_servers(
+            role=self._profile_role(profile),
+            conversation_id=conversation_id,
+            session_id=conversation_id,
+        )
+
+    def _task_workspace(self, spec: dict[str, Any]) -> str:
+        raw = spec.get("workspace") or spec.get("repo_root") or self.default_workspace
+        if not raw:
+            raise ValueError("team task requires task_spec.workspace or manager default workspace")
+        return str(Path(raw).expanduser().resolve())
+
+    def _team_checkpoint(self, task_id: str, attempt_id: str, spec: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "task_id": task_id,
+            "attempt_id": attempt_id,
+            "task_spec": spec,
+            "instruction": "Resume this delegated coding task from persisted context.",
+        }
+
+    def _team_context_package(
+        self,
+        *,
+        task: dict[str, Any],
+        workspace: str,
+        session_id: Optional[str],
+    ) -> str:
+        spec = task.get("task_spec") or {}
+        query = str(spec.get("memory_query") or "").strip().lower()
+        scopes = [
+            self.memory_store.list(scope=Scope.GLOBAL),
+            self.memory_store.list(scope=Scope.WORKSPACE, workspace=workspace),
+        ]
+        if session_id:
+            scopes.append(self.memory_store.list(scope=Scope.SESSION, session_id=session_id))
+        seen: set[int] = set()
+        selected = []
+        for items in scopes:
+            for item in items:
+                if item.id in seen:
+                    continue
+                text = item.content
+                if query and query not in text.lower():
+                    continue
+                seen.add(item.id)
+                selected.append(item)
+                if len(selected) >= 20:
+                    break
+            if len(selected) >= 20:
+                break
+        lines: list[str] = []
+        budget = 8000
+        for item in selected:
+            line = f"- [#{item.id} {item.scope.value}] {item.content}"
+            if len("\n".join(lines)) + len(line) + 1 > budget:
+                break
+            lines.append(line)
+        if not lines:
+            return ""
+        return (
+            "Scoped knowledge package. These are text memories only; do not request or "
+            "use raw audio files.\n" + "\n".join(lines)
+        )
+
+    def _followup_reopen_messages(self, task_id: str) -> list[dict[str, Any]]:
+        reopen_ids = {
+            str(event.payload.get("message_id"))
+            for event in self.orchestrator.store.list_events(
+                aggregate_type="task",
+                aggregate_id=task_id,
+            )
+            if event.event_type == "agent.message.followup_reopen"
+        }
+        if not reopen_ids:
+            return []
+        return [
+            item
+            for item in self.orchestrator.pending_messages(task_id)
+            if str(item.get("message_id")) in reopen_ids
+        ]
+
+    def _followup_reopen_source(self, task_id: str) -> Optional[dict[str, Any]]:
+        events = [
+            event
+            for event in self.orchestrator.store.list_events(
+                aggregate_type="task",
+                aggregate_id=task_id,
+            )
+            if event.event_type == "agent.message.followup_reopen"
+        ]
+        return dict(events[-1].payload) if events else None
+
+    def _team_executor_prompt(
+        self,
+        *,
+        task: dict[str, Any],
+        attempt_id: str,
+        workspace: str,
+        rework_message: Optional[str] = None,
+    ) -> str:
+        spec = task.get("task_spec") or {}
+        context = self._team_context_package(
+            task=task,
+            workspace=workspace,
+            session_id=task.get("conversation_id"),
+        )
+        payload = {
+            "task_id": task.get("task_id"),
+            "attempt_id": attempt_id,
+            "workspace": workspace,
+            "task_spec": spec,
+        }
+        parts = [
+            "You are the executor Agent in qh-openworker. Work only in the provided "
+            "workspace/worktree, keep changes minimal, and finish with a concise structured summary.",
+            json.dumps(payload, ensure_ascii=False, indent=2),
+        ]
+        if context:
+            parts.append(context)
+        if rework_message:
+            parts.append("Rework request from reviewer/tests:\n" + rework_message)
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _latest_attempt(task: dict[str, Any], *, role: str) -> Optional[dict[str, Any]]:
+        attempts = [
+            item for item in task.get("attempts") or [] if item.get("role") == role
+        ]
+        return attempts[-1] if attempts else None
+
+    @staticmethod
+    def _latest_artifact(task: dict[str, Any], *, kind: str) -> Optional[dict[str, Any]]:
+        artifacts = [item for item in task.get("artifacts") or [] if item.get("kind") == kind]
+        if not artifacts:
+            return None
+        artifact = dict(artifacts[-1])
+        artifact.setdefault("artifact_id", artifact.get("id"))
+        return artifact
+
+    @staticmethod
+    def _profile_role(profile: AgentProfile) -> str:
+        return str(getattr(profile.role, "value", profile.role))
+
+    async def _open_team_session(
+        self,
+        *,
+        profile: AgentProfile,
+        cwd: str,
+        existing_session_id: Optional[str],
+        checkpoint: dict[str, Any],
+    ) -> tuple[Any, Any]:
+        adapter = self._agent_adapter(profile)
+        if profile.transport == Transport.ACP_STDIO:
+            handle = await adapter.open_session(
+                profile,
+                cwd=cwd,
+                existing_session_id=existing_session_id,
+                checkpoint=checkpoint,
+                mcp_servers=self._team_mcp_servers(role=self._profile_role(profile)),
+            )
+        else:
+            handle = await adapter.open_session(
+                profile,
+                cwd=cwd,
+                existing_session_id=existing_session_id,
+            )
+        return adapter, handle
+
+    @staticmethod
+    def _mission_plan_members(task: dict[str, Any]) -> list[dict[str, Any]]:
+        plan = (task.get("task_spec") or {}).get("plan") or {}
+        members = plan.get("members") if isinstance(plan, dict) else None
+        return [dict(member) for member in members or [] if isinstance(member, dict)]
+
+    @staticmethod
+    def _latest_attempt_for_member(
+        task: dict[str, Any], *, role: str, profile_id: str
+    ) -> Optional[dict[str, Any]]:
+        attempts = [
+            item
+            for item in task.get("attempts") or []
+            if item.get("role") == role and item.get("agent_profile_id") == profile_id
+        ]
+        return attempts[-1] if attempts else None
+
+    @staticmethod
+    def _preflight_artifact_for_guard(
+        task: dict[str, Any], prompt_guard_id: str
+    ) -> Optional[dict[str, Any]]:
+        for item in reversed(task.get("artifacts") or []):
+            if (item.get("metadata") or {}).get("prompt_guard_id") != prompt_guard_id:
+                continue
+            artifact = dict(item)
+            artifact.setdefault("artifact_id", artifact.get("id"))
+            return artifact
+        return None
+
+    def _mission_specialist_prompt(
+        self,
+        *,
+        task: dict[str, Any],
+        member: dict[str, Any],
+        attempt_id: str,
+        workspace: str,
+    ) -> str:
+        role = str(member.get("role") or "")
+        context = self._team_context_package(
+            task=task,
+            workspace=workspace,
+            session_id=task.get("conversation_id"),
+        )
+        payload = {
+            "task_id": task.get("task_id"),
+            "attempt_id": attempt_id,
+            "role": role,
+            "workspace": workspace,
+            "goal": (task.get("task_spec") or {}).get("goal") or task.get("title"),
+            "member": member,
+        }
+        if role == AgentRole.EXPLORER.value:
+            instruction = (
+                "You are the read-only explorer Agent. Inspect the workspace, identify the "
+                "minimal implementation context, likely files, risks, and test strategy. "
+                "Do not modify files or run write commands. Return a concise structured summary."
+            )
+        else:
+            instruction = (
+                "You are the read-only GUI specialist Agent. Inspect only the UI surface and "
+                "return visual/interaction guidance, impacted files, and evidence needed. "
+                "Do not modify files or run write commands."
+            )
+        parts = [instruction, json.dumps(payload, ensure_ascii=False, indent=2)]
+        if context:
+            parts.append(context)
+        return "\n\n".join(parts)
+
+    async def _run_mission_preflight_members(self, task: dict[str, Any]) -> None:
+        """Run safe Mission specialists before the single writer starts.
+
+        Main remains a synthetic/orchestrator seat in this MVP. Explorer and
+        read-only GUI seats can produce context before executor owns a worktree.
+        Unsafe GUI profiles are explicitly skipped instead of sharing the
+        executor worktree or pretending to have run.
+        """
+
+        task_id = str(task["task_id"])
+        spec = task.get("task_spec") or {}
+        workspace = str(self._task_workspace(spec))
+        for member in self._mission_plan_members(task):
+            role = str(member.get("role") or "")
+            if role not in {AgentRole.EXPLORER.value, AgentRole.GUI.value}:
+                continue
+            member_id = str(member.get("id") or member.get("seat_id") or "")
+            profile_id = str(member.get("profile_id") or "")
+            if not member_id or not profile_id:
+                continue
+            task = self.agent_task_result(task_id)
+            prompt_guard_id = f"{task_id}:member_preflight:{member_id}"
+            if self._preflight_artifact_for_guard(task, prompt_guard_id) is not None:
+                continue
+            profile = self.agent_profiles.get(profile_id)
+            if profile is None or not profile.enabled:
+                self.orchestrator.update_mission_member_status(
+                    task_id,
+                    member_id=member_id,
+                    profile_id=profile_id,
+                    role=role,
+                    status="blocked",
+                    event_id=f"{prompt_guard_id}:blocked:profile",
+                    details={"reason": "profile is missing or disabled"},
+                )
+                raise ValueError(f"invalid {role} profile: {profile_id}")
+            if self._profile_role(profile) != role:
+                self.orchestrator.update_mission_member_status(
+                    task_id,
+                    member_id=member_id,
+                    profile_id=profile_id,
+                    role=role,
+                    status="blocked",
+                    event_id=f"{prompt_guard_id}:blocked:role",
+                    details={"reason": "profile role does not match member role"},
+                )
+                raise ValueError(f"{role} member profile role mismatch: {profile_id}")
+            if role == AgentRole.EXPLORER.value and profile.permission_policy != "read-only":
+                self.orchestrator.update_mission_member_status(
+                    task_id,
+                    member_id=member_id,
+                    profile_id=profile_id,
+                    role=role,
+                    status="blocked",
+                    event_id=f"{prompt_guard_id}:blocked:permission",
+                    details={"reason": "explorer profiles must be read-only"},
+                )
+                raise ValueError("explorer profiles must be read-only")
+            if role == AgentRole.GUI.value and profile.permission_policy != "read-only":
+                skip_event_id = f"{prompt_guard_id}:skipped:unsafe_gui"
+                if self.orchestrator.store.get_event(skip_event_id) is not None:
+                    continue
+                self.orchestrator.update_mission_member_status(
+                    task_id,
+                    member_id=member_id,
+                    profile_id=profile_id,
+                    role=role,
+                    status="skipped",
+                    event_id=skip_event_id,
+                    details={
+                        "reason": (
+                            "gui profile is not read-only; deferred until isolated "
+                            "GUI worktree scheduling is available"
+                        )
+                    },
+                )
+                self.add_agent_artifact(
+                    task_id,
+                    {
+                        "kind": "gui.deferred",
+                        "payload": {
+                            "member_id": member_id,
+                            "profile_id": profile_id,
+                            "reason": "unsafe gui profile deferred",
+                        },
+                    },
+                )
+                await self._enqueue_team_delivery(
+                    task,
+                    {
+                        "summary": "gui specialist skipped",
+                        "member_id": member_id,
+                        "reason": "unsafe gui profile deferred",
+                    },
+                    delivery_id=f"{prompt_guard_id}:delivery",
+                )
+                continue
+
+            latest = self._latest_attempt_for_member(
+                task, role=role, profile_id=profile_id
+            )
+            if latest is None or latest.get("state") in {"completed", "failed", "cancelled"}:
+                latest = self.start_agent_attempt(
+                    task_id,
+                    {
+                        "profile_id": profile_id,
+                        "role": role,
+                        "rework_round": self.orchestrator.store.rework_round_count(task_id),
+                    },
+                )
+            attempt_id = str(latest["attempt_id"])
+            first_execution = self.orchestrator.store.should_execute_once(
+                prompt_guard_id,
+                event_type="agent.prompt.started",
+                aggregate_type="task",
+                aggregate_id=task_id,
+                payload={
+                    "attempt_id": attempt_id,
+                    "role": role,
+                    "member_id": member_id,
+                },
+            )
+            if not first_execution:
+                raise RuntimeError(
+                    f"{role} preflight outcome is unknown; refusing automatic replay"
+                )
+            adapter = None
+            handle = None
+            try:
+                adapter, handle = await self._open_team_session(
+                    profile=profile,
+                    cwd=workspace,
+                    existing_session_id=latest.get("agent_session_id"),
+                    checkpoint={
+                        "task_id": task_id,
+                        "attempt_id": attempt_id,
+                        "member_id": member_id,
+                        "role": role,
+                    },
+                )
+                self.orchestrator.save_agent_session(
+                    session_id=handle.session_id,
+                    conversation_id=str(task.get("conversation_id") or task_id),
+                    profile_id=profile.id,
+                    task_id=task_id,
+                    attempt_id=attempt_id,
+                    capabilities=handle.capabilities,
+                    metadata={"role": role, "cwd": workspace, "read_only": True},
+                )
+                self.orchestrator.update_attempt(
+                    attempt_id,
+                    "running",
+                    agent_session_id=handle.session_id,
+                )
+                prompt = self._mission_specialist_prompt(
+                    task=task,
+                    member=member,
+                    attempt_id=attempt_id,
+                    workspace=workspace,
+                )
+                result = await adapter.prompt(handle, prompt)
+                artifact = self.add_agent_artifact(
+                    task_id,
+                    {
+                        "kind": f"{role}.preflight",
+                        "attempt_id": attempt_id,
+                        "payload": {
+                            "member_id": member_id,
+                            "session_id": handle.session_id,
+                            "stop_reason": str(result.stop_reason),
+                            "text": result.text,
+                            "prompt_guard_id": prompt_guard_id,
+                            "events": [
+                                event
+                                for event in result.events
+                                if isinstance(event, dict)
+                                and event.get("type") != "acp.permission_requested"
+                            ],
+                        },
+                    },
+                )
+                self.orchestrator.store.append_event(
+                    {
+                        "event_id": f"{prompt_guard_id}:completed",
+                        "event_type": "agent.prompt.completed",
+                        "aggregate_type": "task",
+                        "aggregate_id": task_id,
+                        "payload": {
+                            "attempt_id": attempt_id,
+                            "role": role,
+                            "member_id": member_id,
+                            "artifact_id": artifact.get("artifact_id"),
+                        },
+                    }
+                )
+                self.orchestrator.update_attempt(attempt_id, "completed")
+                await self._enqueue_team_delivery(
+                    task,
+                    {
+                        "summary": f"{role} specialist finished",
+                        "member_id": member_id,
+                        "artifact_id": artifact.get("artifact_id"),
+                    },
+                    delivery_id=f"{prompt_guard_id}:delivery",
+                )
+            except Exception:
+                with contextlib.suppress(Exception):
+                    self.orchestrator.update_attempt(attempt_id, "failed")
+                raise
+            finally:
+                if adapter is not None and handle is not None:
+                    with contextlib.suppress(Exception):
+                        await adapter.close(handle)
+
+    async def _ensure_executor_runtime(
+        self, task: dict[str, Any]
+    ) -> tuple[Any, Any, dict[str, Any], str]:
+        task_id = str(task["task_id"])
+        spec = task.get("task_spec") or {}
+        profile_id = str(task.get("target_profile_id") or "opencode-executor")
+        profile = self.agent_profiles.get(profile_id)
+        if profile is None or not profile.enabled:
+            raise ValueError(f"invalid target profile: {profile_id}")
+        role_value = self._profile_role(profile)
+        if role_value != "executor":
+            raise ValueError("team worker currently requires an executor target profile")
+
+        active = self._team_active.get(task_id)
+        if active and active.get("role") == role_value:
+            return active["adapter"], active["handle"], active["attempt"], active["cwd"]
+
+        latest = self._latest_attempt(task, role=role_value)
+        repo_workspace = self._task_workspace(spec)
+        rework_round = self.orchestrator.store.rework_round_count(task_id)
+        if latest is None or latest.get("state") in {"completed", "failed", "cancelled"}:
+            reopen = self._followup_reopen_source(task_id)
+            latest = self.start_agent_attempt(
+                task_id,
+                {
+                    "profile_id": profile_id,
+                    "role": role_value,
+                    "agent_session_id": (reopen or {}).get("agent_session_id"),
+                    "worktree_path": (reopen or {}).get("worktree"),
+                    "rework_round": rework_round,
+                },
+            )
+            if latest.get("worktree"):
+                acquired = self.orchestrator.store.acquire_worktree_lease(
+                    worktree=str(latest["worktree"]),
+                    task_id=task_id,
+                    attempt_id=str(latest["attempt_id"]),
+                )
+                if not acquired:
+                    raise RuntimeError(f"worktree lease already held: {latest['worktree']}")
+        attempt_id = str(latest["attempt_id"])
+        cwd = latest.get("worktree") or repo_workspace
+
+        if role_value == "executor" and profile.workspace_policy == "worktree" and not latest.get("worktree"):
+            plan = self.worktrees.create_executor_worktree(
+                repo_root=repo_workspace,
+                task_id=task_id,
+                attempt_id=attempt_id,
+                base_ref=str(spec.get("base_ref") or "HEAD"),
+            )
+            self.orchestrator.store.update_attempt_worktree(attempt_id, plan.worktree_path)
+            latest = {**latest, "worktree": plan.worktree_path}
+            cwd = plan.worktree_path
+            self.add_agent_artifact(
+                task_id,
+                {
+                    "kind": "worktree.plan",
+                    "attempt_id": attempt_id,
+                    "path": plan.worktree_path,
+                    "payload": plan.to_dict(),
+                },
+            )
+
+        adapter, handle = await self._open_team_session(
+            profile=profile,
+            cwd=str(cwd),
+            existing_session_id=latest.get("agent_session_id"),
+            checkpoint=self._team_checkpoint(task_id, attempt_id, spec),
+        )
+        self.orchestrator.save_agent_session(
+            session_id=handle.session_id,
+            conversation_id=str(task.get("conversation_id") or task_id),
+            profile_id=profile.id,
+            task_id=task_id,
+            attempt_id=attempt_id,
+            capabilities=handle.capabilities,
+            metadata={"role": role_value, "cwd": str(cwd), "recovery_mode": handle.recovery_mode},
+        )
+        self.orchestrator.update_attempt(
+            attempt_id,
+            "running",
+            agent_session_id=handle.session_id,
+        )
+        latest = {**latest, "agent_session_id": handle.session_id, "worktree": str(cwd)}
+        self._team_active[task_id] = {
+            "role": role_value,
+            "adapter": adapter,
+            "handle": handle,
+            "attempt": latest,
+            "cwd": str(cwd),
+        }
+        return adapter, handle, latest, str(cwd)
+
+    async def _run_executor_prompt(
+        self, task: dict[str, Any], *, rework_message: Optional[str] = None
+    ) -> dict[str, Any]:
+        task_id = str(task["task_id"])
+        adapter, handle, attempt, cwd = await self._ensure_executor_runtime(task)
+        attempt_id = str(attempt["attempt_id"])
+        followups = self._followup_reopen_messages(task_id)
+        followup_message_ids = [
+            str(item.get("message_id") or "")
+            for item in followups
+            if str(item.get("message_id") or "")
+        ]
+        if followups:
+            prompt = "[user-followup]\n" + "\n\n".join(
+                str(item.get("message") or "").strip()
+                for item in followups
+                if str(item.get("message") or "").strip()
+            )
+        else:
+            prompt = self._team_executor_prompt(
+                task=task,
+                attempt_id=attempt_id,
+                workspace=cwd,
+                rework_message=rework_message,
+            )
+        turn_identity = (
+            "followup:" + ",".join(followup_message_ids)
+            if followup_message_ids
+            else "state:"
+            + str(task.get("state") or "IMPLEMENTING")
+            + ":rework:"
+            + str(self.orchestrator.store.rework_round_count(task_id))
+        )
+        turn_digest = hashlib.sha256(turn_identity.encode("utf-8")).hexdigest()[:20]
+        prompt_guard_id = f"{task_id}:executor_prompt:{attempt_id}:{turn_digest}"
+        existing = self._execution_artifact_for_guard(task, prompt_guard_id)
+        if existing is not None:
+            for message_id in followup_message_ids:
+                self.orchestrator.mark_message_delivered(task_id, message_id)
+            return existing
+        first_execution = self.orchestrator.store.should_execute_once(
+            prompt_guard_id,
+            event_type="agent.prompt.started",
+            aggregate_type="task",
+            aggregate_id=task_id,
+            payload={
+                "attempt_id": attempt_id,
+                "role": "executor",
+                "turn_identity": turn_identity,
+                "message_ids": followup_message_ids,
+            },
+        )
+        if not first_execution:
+            raise RuntimeError(
+                "executor prompt outcome is unknown; refusing automatic replay"
+            )
+        result = await adapter.prompt(handle, prompt)
+        artifact = self.add_agent_artifact(
+            task_id,
+            {
+                "kind": "execution",
+                "attempt_id": attempt_id,
+                "payload": {
+                    "session_id": handle.session_id,
+                    "stop_reason": str(result.stop_reason),
+                    "text": result.text,
+                    "prompt_guard_id": prompt_guard_id,
+                    "followup_message_ids": followup_message_ids,
+                    "events": [
+                        event
+                        for event in result.events
+                        if isinstance(event, dict)
+                        and event.get("type") != "acp.permission_requested"
+                    ],
+                },
+            },
+        )
+        self.orchestrator.store.append_event(
+            {
+                "event_id": f"{prompt_guard_id}:completed",
+                "event_type": "agent.prompt.completed",
+                "aggregate_type": "task",
+                "aggregate_id": task_id,
+                "payload": {
+                    "attempt_id": attempt_id,
+                    "artifact_id": artifact.get("artifact_id"),
+                    "message_ids": followup_message_ids,
+                },
+            }
+        )
+        for message_id in followup_message_ids:
+            self.orchestrator.mark_message_delivered(task_id, message_id)
+        return artifact
+
+    @staticmethod
+    def _execution_artifact_for_guard(
+        task: dict[str, Any], prompt_guard_id: str
+    ) -> Optional[dict[str, Any]]:
+        for item in reversed(task.get("artifacts") or []):
+            if item.get("kind") != "execution":
+                continue
+            if (item.get("metadata") or {}).get("prompt_guard_id") != prompt_guard_id:
+                continue
+            artifact = dict(item)
+            artifact.setdefault("artifact_id", artifact.get("id"))
+            return artifact
+        return None
+
+    def _retain_team_worktree(self, task: dict[str, Any], *, state: str) -> None:
+        task_id = str(task["task_id"])
+        attempt = self._latest_attempt(task, role="executor")
+        if not attempt or not attempt.get("worktree"):
+            return
+        attempt_id = str(attempt["attempt_id"])
+        event_id = f"{task_id}:worktree_retained:{attempt_id}:{state}"
+        inserted = self.orchestrator.store.should_execute_once(
+            event_id,
+            event_type="worktree.retained",
+            aggregate_type="task",
+            aggregate_id=task_id,
+            payload={
+                "attempt_id": attempt_id,
+                "worktree": attempt.get("worktree"),
+                "state": state,
+            },
+        )
+        if inserted:
+            self.add_agent_artifact(
+                task_id,
+                {
+                    "kind": "worktree.retained",
+                    "attempt_id": attempt_id,
+                    "path": attempt.get("worktree"),
+                    "payload": {
+                        "attempt_id": attempt_id,
+                        "worktree": attempt.get("worktree"),
+                        "state": state,
+                    },
+                },
+            )
+
+    async def _enqueue_terminal_delivery_once(
+        self, task: dict[str, Any], *, state: str
+    ) -> None:
+        task_id = str(task["task_id"])
+        attempt = self._latest_attempt(task, role="executor") or {}
+        key_attempt = str(attempt.get("attempt_id") or "none")
+        await self._enqueue_team_delivery(
+            task,
+            {
+                "summary": f"team task {state.lower()}",
+                "state": state,
+                "task_id": task_id,
+            },
+            delivery_id=f"delivery_terminal:{task_id}:{key_attempt}:{state}",
+        )
+
+    async def _deliver_attempt_target_messages(
+        self, task_id: str, attempt_id: str
+    ) -> list[str]:
+        """Resume/load a specialist ACP session and deliver its queued follow-ups."""
+
+        attempt = self.orchestrator.store.get_attempt(attempt_id)
+        if attempt is None or attempt.task_id != task_id:
+            raise OrchestrationStoreError("message target attempt does not belong to mission")
+        if not attempt.agent_session_id:
+            raise OrchestrationStoreError(
+                "attempt follow-up requires a recoverable agent session"
+            )
+        profile = self.agent_profiles.get(attempt.agent_profile_id)
+        if profile is None or not profile.enabled or profile.role != attempt.role:
+            raise OrchestrationStoreError("attempt Agent profile is unavailable")
+        task = self.agent_task_result(task_id)
+        spec = task.get("task_spec") or {}
+        cwd = str(attempt.worktree or self._task_workspace(spec))
+        pending = [
+            item
+            for item in self.orchestrator.pending_messages(task_id)
+            if isinstance(item.get("target"), dict)
+            and item["target"].get("kind") == "attempt"
+            and str(item["target"].get("attempt_id") or "") == attempt_id
+        ]
+        if not pending:
+            return []
+
+        adapter = None
+        handle = None
+        delivered: list[str] = []
+        try:
+            adapter, handle = await self._open_team_session(
+                profile=profile,
+                cwd=cwd,
+                existing_session_id=attempt.agent_session_id,
+                checkpoint={
+                    "task_id": task_id,
+                    "attempt_id": attempt_id,
+                    "role": attempt.role.value,
+                    "mode": "user-followup",
+                },
+            )
+            self.orchestrator.save_agent_session(
+                session_id=handle.session_id,
+                conversation_id=str(task.get("conversation_id") or task_id),
+                profile_id=profile.id,
+                task_id=task_id,
+                attempt_id=attempt_id,
+                capabilities=handle.capabilities,
+                metadata={
+                    "role": attempt.role.value,
+                    "cwd": cwd,
+                    "recovery_mode": handle.recovery_mode,
+                    "followup": True,
+                },
+            )
+            if handle.session_id != attempt.agent_session_id:
+                self.orchestrator.store.update_attempt_status(
+                    attempt_id,
+                    attempt.status,
+                    agent_session_id=handle.session_id,
+                )
+            for item in pending:
+                message_id = str(item.get("message_id") or "")
+                message = str(item.get("message") or "").strip()
+                if not message_id or not message:
+                    if message_id:
+                        self.orchestrator.mark_message_delivered(task_id, message_id)
+                        delivered.append(message_id)
+                    continue
+                guard_id = f"{message_id}:agent_prompt"
+                first_execution = self.orchestrator.store.should_execute_once(
+                    guard_id,
+                    event_type="agent.message.prompt.started",
+                    aggregate_type="task",
+                    aggregate_id=task_id,
+                    payload={"message_id": message_id, "attempt_id": attempt_id},
+                )
+                if not first_execution:
+                    completed = self.orchestrator.store.get_event(
+                        f"{guard_id}:completed"
+                    )
+                    if completed is not None:
+                        self.orchestrator.mark_message_delivered(task_id, message_id)
+                        delivered.append(message_id)
+                        continue
+                    raise RuntimeError(
+                        f"message {message_id} prompt outcome is unknown; refusing replay"
+                    )
+                turn = await adapter.prompt(handle, "[user-followup]\n" + message)
+                artifact = self.add_agent_artifact(
+                    task_id,
+                    {
+                        "kind": f"{attempt.role.value}.followup",
+                        "attempt_id": attempt_id,
+                        "payload": {
+                            "message_id": message_id,
+                            "session_id": handle.session_id,
+                            "stop_reason": str(turn.stop_reason),
+                            "text": turn.text,
+                        },
+                    },
+                )
+                self.orchestrator.store.append_event(
+                    {
+                        "event_id": f"{guard_id}:completed",
+                        "event_type": "agent.message.prompt.completed",
+                        "aggregate_type": "task",
+                        "aggregate_id": task_id,
+                        "payload": {
+                            "message_id": message_id,
+                            "attempt_id": attempt_id,
+                            "artifact_id": artifact.get("artifact_id"),
+                        },
+                    }
+                )
+                self.orchestrator.mark_message_delivered(task_id, message_id)
+                delivered.append(message_id)
+        finally:
+            if adapter is not None and handle is not None:
+                with contextlib.suppress(Exception):
+                    await adapter.close(handle)
+        return delivered
+
+    async def _deliver_pending_task_messages(self, task: dict[str, Any]) -> None:
+        task_id = str(task["task_id"])
+        active = self._team_active.get(task_id)
+        if not active:
+            return
+        adapter = active["adapter"]
+        handle = active["handle"]
+        active_attempt_id = str((active.get("attempt") or {}).get("attempt_id") or "")
+        for item in self.orchestrator.pending_messages(task_id):
+            target = item.get("target") if isinstance(item.get("target"), dict) else {}
+            target_kind = str(target.get("kind") or "")
+            if target_kind == "main":
+                continue
+            if (
+                target_kind == "attempt"
+                and str(target.get("attempt_id") or "") != active_attempt_id
+            ):
+                continue
+            message_id = str(item.get("message_id") or "")
+            message = str(item.get("message") or "").strip()
+            if not message:
+                if message_id:
+                    self.orchestrator.mark_message_delivered(task_id, message_id)
+                continue
+            guard_id = f"{message_id}:agent_prompt"
+            first_execution = self.orchestrator.store.should_execute_once(
+                guard_id,
+                event_type="agent.message.prompt.started",
+                aggregate_type="task",
+                aggregate_id=task_id,
+                payload={"message_id": message_id},
+            )
+            if not first_execution:
+                completed = any(
+                    event.event_id == f"{guard_id}:completed"
+                    for event in self.orchestrator.store.list_events(
+                        aggregate_type="task", aggregate_id=task_id
+                    )
+                )
+                if completed and message_id:
+                    self.orchestrator.mark_message_delivered(task_id, message_id)
+                    continue
+                raise RuntimeError(
+                    f"message {message_id} prompt outcome is unknown; refusing replay"
+                )
+            await adapter.prompt(handle, "[user-followup]\n" + message)
+            self.orchestrator.store.append_event(
+                {
+                    "event_id": f"{guard_id}:completed",
+                    "event_type": "agent.message.prompt.completed",
+                    "aggregate_type": "task",
+                    "aggregate_id": task_id,
+                    "payload": {"message_id": message_id},
+                }
+            )
+            if message_id:
+                self.orchestrator.mark_message_delivered(task_id, message_id)
+
+    async def _run_team_verification(
+        self, task: dict[str, Any], *, attempt: dict[str, Any], cwd: str
+    ) -> dict[str, Any]:
+        spec = task.get("task_spec") or {}
+        commands: list[list[str]] = []
+        configured = spec.get("test_commands")
+        if isinstance(configured, list):
+            for item in configured:
+                if isinstance(item, str):
+                    commands.append(shlex.split(item))
+                elif isinstance(item, list):
+                    commands.append([str(part) for part in item])
+        if not commands:
+            root = Path(cwd)
+            if (root / "pyproject.toml").exists() and (root / "tests").is_dir():
+                commands.append([sys.executable, "-m", "pytest", "-q"])
+
+        results: list[dict[str, Any]] = []
+        skipped = not commands
+        passed = True
+        timeout = float((spec.get("verification_timeout_seconds") or 600))
+        for argv in commands:
+            if not argv:
+                continue
+            if not self._is_safe_verification_command(argv):
+                results.append(
+                    {
+                        "argv": argv,
+                        "passed": False,
+                        "error": "verification command is outside the host test-runner allowlist",
+                    }
+                )
+                passed = False
+                continue
+            started = time.time()
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *argv,
+                    cwd=cwd,
+                    env=build_minimal_env(),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                stdout = stdout_b.decode("utf-8", errors="replace")[-12000:]
+                stderr = stderr_b.decode("utf-8", errors="replace")[-12000:]
+                ok = proc.returncode == 0
+                results.append(
+                    {
+                        "argv": argv,
+                        "returncode": proc.returncode,
+                        "passed": ok,
+                        "duration_seconds": round(time.time() - started, 3),
+                        "stdout": stdout,
+                        "stderr": stderr,
+                    }
+                )
+                passed = passed and ok
+            except asyncio.TimeoutError:
+                with contextlib.suppress(Exception):
+                    proc.kill()  # type: ignore[name-defined]
+                results.append({"argv": argv, "passed": False, "timeout_seconds": timeout})
+                passed = False
+
+        artifact = self.add_agent_artifact(
+            str(task["task_id"]),
+            {
+                "kind": "verification",
+                "attempt_id": attempt.get("attempt_id"),
+                "payload": {
+                    "passed": passed and not skipped,
+                    "skipped": skipped,
+                    "commands": commands,
+                    "results": results,
+                },
+            },
+        )
+        return {**artifact, "passed": passed and not skipped, "skipped": skipped}
+
+    @staticmethod
+    def _is_safe_verification_command(argv: list[str]) -> bool:
+        """Accept test runners only; never execute arbitrary task-provided programs."""
+
+        if not argv:
+            return False
+        raw_executable = Path(argv[0])
+        if raw_executable.is_absolute() and raw_executable.resolve() != Path(
+            sys.executable
+        ).resolve():
+            return False
+        if not raw_executable.is_absolute() and len(raw_executable.parts) != 1:
+            return False
+        executable = raw_executable.name.lower()
+        if executable.endswith(".exe"):
+            executable = executable[:-4]
+        python_names = {
+            "python",
+            "python3",
+            f"python{sys.version_info.major}.{sys.version_info.minor}",
+            Path(sys.executable).name.lower(),
+        }
+        if executable in python_names:
+            return len(argv) >= 3 and argv[1:3] == ["-m", "pytest"]
+        if executable in {"pytest", "py.test"}:
+            return True
+        if executable in {"npm", "pnpm", "yarn", "bun"}:
+            return (len(argv) >= 2 and argv[1] == "test") or (
+                len(argv) >= 3 and argv[1:3] == ["run", "test"]
+            )
+        if executable == "cargo":
+            return len(argv) >= 2 and argv[1] == "test"
+        if executable == "go":
+            return len(argv) >= 2 and argv[1] == "test"
+        if executable in {"mvn", "mvnw", "gradle", "gradlew"}:
+            return len(argv) >= 2 and argv[1] in {"test", "check"}
+        return False
+
+    def _verification_failed_message(self, artifact: dict[str, Any]) -> str:
+        meta = artifact.get("metadata") or {}
+        if meta.get("skipped"):
+            return "Verification was skipped because no safe test command was configured or detected."
+        failures = [item for item in meta.get("results") or [] if not item.get("passed")]
+        return "Verification failed:\n" + json.dumps(failures, ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def _existing_review_for_artifact(
+        task: dict[str, Any], artifact_id: str
+    ) -> Optional[dict[str, Any]]:
+        for review in reversed(task.get("reviews") or []):
+            if str(review.get("artifact_id") or "") == artifact_id:
+                return dict(review)
+        return None
+
+    def _resume_recorded_review(
+        self,
+        task_id: str,
+        review: dict[str, Any],
+        *,
+        tests_passed: bool,
+    ) -> dict[str, Any]:
+        """Finish state transitions after a review row committed before a crash."""
+
+        attempt_id = str(review.get("reviewer_attempt_id") or "")
+        if attempt_id:
+            with contextlib.suppress(Exception):
+                self.orchestrator.update_attempt(attempt_id, "completed")
+        current = self.agent_task_status(task_id)
+        if current.get("state") != "REVIEWING":
+            return current
+        verdict = str(review.get("verdict") or "request_changes")
+        effective_verdict = verdict
+        if verdict == "pass" and not tests_passed:
+            effective_verdict = "request_changes"
+        if effective_verdict == "pass":
+            self.orchestrator.set_task_state(task_id, "APPROVED")
+            self.orchestrator.set_task_state(task_id, "DONE")
+        elif effective_verdict == "block":
+            self.orchestrator.set_task_state(task_id, "BLOCKED")
+        else:
+            self.orchestrator.set_task_state(task_id, "CHANGES_REQUESTED")
+        return {**self.agent_task_status(task_id), "effective_verdict": effective_verdict}
+
+    async def _run_team_review(
+        self,
+        task: dict[str, Any],
+        *,
+        execution_artifact: dict[str, Any],
+        verification_artifact: dict[str, Any],
+        cwd: str,
+    ) -> dict[str, Any]:
+        task_id = str(task["task_id"])
+        execution_artifact = dict(execution_artifact)
+        verification_artifact = dict(verification_artifact)
+        execution_artifact.setdefault("artifact_id", execution_artifact.get("id"))
+        verification_artifact.setdefault("artifact_id", verification_artifact.get("id"))
+        artifact_id = str(execution_artifact["artifact_id"])
+        tests_passed = bool((verification_artifact.get("metadata") or {}).get("passed"))
+        existing_review = self._existing_review_for_artifact(task, artifact_id)
+        if existing_review is not None:
+            return self._resume_recorded_review(
+                task_id,
+                existing_review,
+                tests_passed=tests_passed,
+            )
+        prompt_guard_id = f"{task_id}:review_prompt:{artifact_id}"
+        first_execution = self.orchestrator.store.should_execute_once(
+            prompt_guard_id,
+            event_type="agent.prompt.started",
+            aggregate_type="task",
+            aggregate_id=task_id,
+            payload={"role": "reviewer", "artifact_id": artifact_id},
+        )
+        if not first_execution:
+            for attempt in task.get("attempts") or []:
+                if attempt.get("role") == "reviewer" and attempt.get("state") not in {
+                    "completed",
+                    "failed",
+                    "cancelled",
+                }:
+                    with contextlib.suppress(Exception):
+                        self.orchestrator.update_attempt(
+                            str(attempt.get("attempt_id") or attempt.get("id")),
+                            "failed",
+                        )
+            raise RuntimeError(
+                "reviewer prompt outcome is unknown; refusing automatic replay"
+            )
+        reviewer_profile = self.agent_profiles.get("opencode-reviewer")
+        if reviewer_profile is None or not reviewer_profile.enabled:
+            raise ValueError("opencode-reviewer profile is missing or disabled")
+        reviewed = self.request_agent_review(execution_artifact["artifact_id"], {})
+        if reviewed.get("state") != "REVIEWING":
+            raise RuntimeError("review request did not enter REVIEWING")
+        attempt = self.start_agent_attempt(
+            task_id,
+            {"profile_id": reviewer_profile.id, "role": "reviewer"},
+        )
+        attempt_id = str(attempt["attempt_id"])
+        adapter = None
+        handle = None
+        try:
+            adapter, handle = await self._open_team_session(
+                profile=reviewer_profile,
+                cwd=cwd,
+                existing_session_id=attempt.get("agent_session_id"),
+                checkpoint={
+                    "task_id": task_id,
+                    "reviewer_attempt_id": attempt_id,
+                    "artifact_id": execution_artifact["artifact_id"],
+                },
+            )
+            self.orchestrator.save_agent_session(
+                session_id=handle.session_id,
+                conversation_id=str(task.get("conversation_id") or task_id),
+                profile_id=reviewer_profile.id,
+                task_id=task_id,
+                attempt_id=attempt_id,
+                capabilities=handle.capabilities,
+                metadata={"role": "reviewer", "cwd": cwd, "read_only": True},
+            )
+            self.orchestrator.update_attempt(
+                attempt_id, "running", agent_session_id=handle.session_id
+            )
+            prompt = (
+                "You are the read-only reviewer Agent. Inspect the fixed artifacts only. "
+                "Return strict JSON: {\"verdict\":\"pass|request_changes|block\","
+                "\"findings\":[{\"id\",\"severity\",\"path\",\"line\",\"title\",\"evidence\","
+                "\"suggested_fix\"}],\"test_gaps\":[],\"confidence\":\"low|medium|high\"}.\n\n"
+                + json.dumps(
+                    {
+                        "task_id": task_id,
+                        "execution_artifact": execution_artifact,
+                        "verification_artifact": verification_artifact,
+                        "worktree": cwd,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            result = await adapter.prompt(handle, prompt)
+            parsed = self._parse_review_result(result.text)
+            recorded = self.record_agent_review(
+                task_id,
+                {
+                    "artifact_id": artifact_id,
+                    "result": parsed,
+                    "reviewer_profile_id": reviewer_profile.id,
+                    "reviewer_attempt_id": attempt_id,
+                    "tests_passed": tests_passed,
+                },
+            )
+            self.orchestrator.store.append_event(
+                {
+                    "event_id": f"{prompt_guard_id}:completed",
+                    "event_type": "agent.prompt.completed",
+                    "aggregate_type": "task",
+                    "aggregate_id": task_id,
+                    "payload": {
+                        "role": "reviewer",
+                        "artifact_id": artifact_id,
+                        "review_id": (recorded.get("review") or {}).get("id"),
+                    },
+                }
+            )
+            return recorded
+        except Exception:
+            with contextlib.suppress(Exception):
+                self.orchestrator.update_attempt(attempt_id, "failed")
+            raise
+        finally:
+            if adapter is not None and handle is not None:
+                with contextlib.suppress(Exception):
+                    await adapter.close(handle)
+
+    async def _close_team_runtime(
+        self,
+        task_id: str,
+        *,
+        cancel: bool = False,
+        final_attempt_status: Optional[str] = None,
+    ) -> None:
+        active = self._team_active.pop(task_id, None)
+        if not active:
+            if final_attempt_status:
+                with contextlib.suppress(Exception):
+                    task = self.agent_task_result(task_id)
+                    attempt = self._latest_attempt(task, role="executor") or {}
+                    if attempt.get("attempt_id") and attempt.get("state") not in {
+                        "completed",
+                        "failed",
+                        "cancelled",
+                    }:
+                        self.orchestrator.update_attempt(
+                            str(attempt["attempt_id"]), final_attempt_status
+                        )
+            return
+        adapter = active.get("adapter")
+        handle = active.get("handle")
+        attempt = active.get("attempt") or {}
+        if adapter is not None and handle is not None:
+            if cancel:
+                with contextlib.suppress(Exception):
+                    await adapter.cancel(handle)
+            with contextlib.suppress(Exception):
+                await adapter.close(handle)
+        if final_attempt_status and attempt.get("attempt_id"):
+            with contextlib.suppress(Exception):
+                self.orchestrator.update_attempt(str(attempt["attempt_id"]), final_attempt_status)
+
+    async def _team_process_task(self, task_id: str) -> None:
+        try:
+            while True:
+                task = self.agent_task_result(task_id)
+                state = str(task.get("state"))
+                if state in {"DONE", "BLOCKED", "CANCELLED"}:
+                    self._retain_team_worktree(task, state=state)
+                    final = (
+                        "cancelled"
+                        if state == "CANCELLED"
+                        else "completed"
+                        if state == "DONE"
+                        else "failed"
+                    )
+                    await self._close_team_runtime(
+                        task_id,
+                        cancel=state == "CANCELLED",
+                        final_attempt_status=final,
+                    )
+                    await self._enqueue_terminal_delivery_once(task, state=state)
+                    attempt = self._latest_attempt(task, role="executor") or {}
+                    self.orchestrator.store.should_execute_once(
+                        self._terminal_finalization_id(task, state=state),
+                        event_type="task.terminal.finalized",
+                        aggregate_type="task",
+                        aggregate_id=task_id,
+                        payload={
+                            "state": state,
+                            "attempt_id": attempt.get("attempt_id"),
+                        },
+                    )
+                    return
+
+                if state == "QUEUED":
+                    await self._run_mission_preflight_members(task)
+                    self.orchestrator.set_task_state(task_id, "IMPLEMENTING")
+                    continue
+
+                if state in {"IMPLEMENTING", "REWORK"}:
+                    profile = self.agent_profiles.get(str(task.get("target_profile_id") or "opencode-executor"))
+                    rework_message = None
+                    if state == "REWORK":
+                        reviews = task.get("reviews") or []
+                        rework_message = json.dumps(reviews[-1] if reviews else {}, ensure_ascii=False)
+                    execution_artifact = await self._run_executor_prompt(
+                        task, rework_message=rework_message
+                    )
+                    await self._deliver_pending_task_messages(task)
+                    self.orchestrator.set_task_state(task_id, "VERIFYING")
+                    await self._enqueue_team_delivery(
+                        task,
+                        {
+                            "summary": "executor finished",
+                            "artifact_id": execution_artifact.get("artifact_id"),
+                        },
+                    )
+                    continue
+
+                if state == "VERIFYING":
+                    attempt = self._latest_attempt(task, role="executor")
+                    if not attempt:
+                        raise RuntimeError("VERIFYING task has no executor attempt")
+                    cwd = attempt.get("worktree") or self._task_workspace(task.get("task_spec") or {})
+                    verification = await self._run_team_verification(
+                        task, attempt=attempt, cwd=str(cwd)
+                    )
+                    if not verification.get("passed"):
+                        message = self._verification_failed_message(verification)
+                        self.orchestrator.set_task_state(task_id, "BLOCKED")
+                        await self._enqueue_team_delivery(
+                            task,
+                            {
+                                "summary": "verification failed",
+                                "artifact_id": verification.get("artifact_id"),
+                                "message": message,
+                            },
+                        )
+                        continue
+                    self.orchestrator.set_task_state(task_id, "REVIEWING")
+                    continue
+
+                if state == "REVIEWING":
+                    attempt = self._latest_attempt(task, role="executor")
+                    execution = self._latest_artifact(task, kind="execution")
+                    verification = self._latest_artifact(task, kind="verification")
+                    if not attempt or not execution or not verification:
+                        raise RuntimeError("REVIEWING task is missing execution/verification artifacts")
+                    cwd = str(attempt.get("worktree") or self._task_workspace(task.get("task_spec") or {}))
+                    review_status = await self._run_team_review(
+                        task,
+                        execution_artifact=execution,
+                        verification_artifact=verification,
+                        cwd=cwd,
+                    )
+                    if review_status.get("state") == "CHANGES_REQUESTED":
+                        if self.orchestrator.store.rework_round_count(task_id) < int(
+                            task.get("max_rework_rounds", QhOrchestratorStore.DEFAULT_MAX_REWORK_ROUNDS)
+                        ):
+                            self.orchestrator.set_task_state(task_id, "REWORK")
+                            continue
+                        self.orchestrator.set_task_state(task_id, "BLOCKED")
+                    continue
+
+                if state == "CHANGES_REQUESTED":
+                    if self.orchestrator.store.rework_round_count(task_id) < int(
+                        task.get("max_rework_rounds", QhOrchestratorStore.DEFAULT_MAX_REWORK_ROUNDS)
+                    ):
+                        self.orchestrator.set_task_state(task_id, "REWORK")
+                        continue
+                    self.orchestrator.set_task_state(task_id, "BLOCKED")
+                    continue
+
+                return
+        except asyncio.CancelledError:
+            await self._close_team_runtime(task_id, cancel=True, final_attempt_status="cancelled")
+            raise
+        except Exception as exc:
+            logger.exception("team worker task failed for %s: %s", task_id, exc)
+            with contextlib.suppress(Exception):
+                self.add_agent_artifact(
+                    task_id,
+                    {"kind": "team.error", "payload": {"error": str(exc)}},
+                )
+                self.orchestrator.set_task_state(task_id, "BLOCKED")
+            await self._close_team_runtime(task_id, cancel=True, final_attempt_status="failed")
+            with contextlib.suppress(Exception):
+                await self._enqueue_team_delivery(
+                    self.agent_task_status(task_id),
+                    {"summary": "team task blocked", "error": str(exc)},
+                )
+        finally:
+            self._team_jobs.pop(task_id, None)
+
+    async def _enqueue_team_delivery(
+        self,
+        task: dict[str, Any],
+        payload: dict[str, Any],
+        *,
+        delivery_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        return self.enqueue_agent_delivery(
+            {
+                "conversation_id": task.get("conversation_id"),
+                "target_session_id": task.get("target_session_id")
+                or task.get("conversation_id")
+                or None,
+                "source_task_id": task.get("task_id"),
+                "payload": payload,
+                "delivery_id": delivery_id,
+            }
+        )
+
+    async def _team_worker_loop(self) -> None:
+        try:
+            while True:
+                try:
+                    await self._team_worker_iteration()
+                except Exception as exc:
+                    logger.warning("team worker iteration failed: %s", exc)
+                await asyncio.sleep(self._team_worker_interval)
+        except asyncio.CancelledError:
+            return
+
+    async def _team_worker_iteration(self) -> None:
+        await self._drain_team_deliveries()
+        states = [
+            "QUEUED",
+            "IMPLEMENTING",
+            "VERIFYING",
+            "REVIEWING",
+            "CHANGES_REQUESTED",
+            "REWORK",
+            "DONE",
+            "BLOCKED",
+            "CANCELLED",
+        ]
+        for task in self.orchestrator.list_tasks(states):
+            task_id = str(task["task_id"])
+            state = str(task.get("state") or "")
+            if state in {"DONE", "BLOCKED", "CANCELLED"} and self._terminal_finalized(
+                task, state=state
+            ):
+                continue
+            existing = self._team_jobs.get(task_id)
+            if existing is not None and not existing.done():
+                continue
+            self._team_jobs[task_id] = asyncio.create_task(self._team_process_task(task_id))
+
+    def _terminal_finalization_id(self, task: dict[str, Any], *, state: str) -> str:
+        attempt = self._latest_attempt(task, role="executor") or {}
+        attempt_id = str(attempt.get("attempt_id") or "none")
+        return f"{task['task_id']}:terminal_finalized:{attempt_id}:{state}"
+
+    def _terminal_finalized(self, task: dict[str, Any], *, state: str) -> bool:
+        finalization_id = self._terminal_finalization_id(task, state=state)
+        return any(
+            event.event_id == finalization_id
+            for event in self.orchestrator.store.list_events(
+                aggregate_type="task",
+                aggregate_id=str(task["task_id"]),
+            )
+        )
+
+    def start_team_worker(self) -> None:
+        if self._team_worker_task is not None and not self._team_worker_task.done():
+            return
+        loop = asyncio.get_running_loop()
+        self._team_worker_task = loop.create_task(self._team_worker_loop())
+
+    async def stop_team_worker(self) -> None:
+        task = self._team_worker_task
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        self._team_worker_task = None
+        jobs = list(self._team_jobs.values())
+        self._team_jobs.clear()
+        for job in jobs:
+            job.cancel()
+        if jobs:
+            await asyncio.gather(*jobs, return_exceptions=True)
+        await asyncio.gather(
+            *(self._close_team_runtime(task_id, cancel=True) for task_id in list(self._team_active)),
+            return_exceptions=True,
+        )
+
+    async def _handle_acp_update(self, event: dict[str, Any]) -> None:
+        logger.debug("acp update: %s", event.get("type"))
+        session_id = event.get("session_id")
+        if session_id:
+            for runtime in getattr(self.main_acp_host, "_runtimes", {}).values():
+                handle = getattr(runtime, "handle", None)
+                if getattr(handle, "session_id", None) == session_id:
+                    # MainAcpHost maps protocol events to the per-conversation UI stream.
+                    # Returning here prevents the same token from also being emitted as an
+                    # app-wide worker event and then replayed again at turn completion.
+                    await self.main_acp_host.handle_update(event)
+                    return
+        await self.broadcast_event({"type": "agent_event", "data": event})
+
+    async def _handle_main_acp_update(self, event: dict[str, Any]) -> None:
+        agent_session_id = event.get("agent_session_id")
+        conversation_id = None
+        for runtime in getattr(self.main_acp_host, "_runtimes", {}).values():
+            handle = getattr(runtime, "handle", None)
+            if getattr(handle, "session_id", None) == agent_session_id:
+                conversation_id = getattr(runtime, "conversation_id", None)
+                break
+        if not conversation_id:
+            return
+        await self.broadcast_session(
+            str(conversation_id),
+            {"type": str(event.get("type") or "agent_event"), "data": event},
+        )
+
+    @staticmethod
+    def _parse_review_result(text: str) -> dict[str, Any]:
+        if not text:
+            return {"verdict": "request_changes", "findings": [], "test_gaps": ["empty review output"], "confidence": "low"}
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+        match = re.search(r"\{[\s\S]*\}", text)
+        if match:
+            try:
+                data = json.loads(match.group(0))
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
+        return {"verdict": "request_changes", "findings": [], "test_gaps": [text[:500]], "confidence": "low"}
+
     # -- direct-message routing -------------------------------------------------
     def dm_session(self) -> Optional[str]:
         """The session a DM to the bot is routed to (user-designated). None → DMs are parked."""
@@ -1735,12 +3995,24 @@ class SessionManager:
     def add_model(self, model: str) -> dict[str, Any]:
         """Add a model id (e.g. `gpt-4o`, `ollama:qwen2.5-coder:32b`) to the picker.
         Custom ids persist in prefs; a previously removed matrix model is just unhidden
-        (storing it too would shadow future matrix updates)."""
+        (storing it too would shadow future matrix updates). Junk ids are rejected up
+        front — a model whose provider isn't configured is still accepted (the settings
+        UI warns about that), only malformed strings are refused."""
         from ..providers.matrix import MATRIX
 
         model = (model or "").strip()
         if not model:
             return {"ok": False, "error": "empty model"}
+        if len(model) > 200 or not model.isprintable() or any(
+            c.isspace() for c in model
+        ):
+            return {
+                "ok": False,
+                "error": (
+                    "invalid model id: printable, no whitespace, at most 200 "
+                    'characters (e.g. "gpt-4o" or "ollama:qwen2.5-coder:32b")'
+                ),
+            }
         hidden = [m for m in self._prefs.get("hidden_models") or [] if m != model]
         if hidden:
             self._prefs["hidden_models"] = hidden
@@ -2030,8 +4302,13 @@ class SessionManager:
         path = (path or "").strip()
         if not path:
             return {"ok": False, "error": "empty path"}
+        resolved = Path(path).expanduser()
+        if not resolved.is_absolute():
+            # A relative path would silently create (and later provision scratch dirs
+            # under) the server process's CWD — effectively a random location.
+            return {"ok": False, "error": "path must be absolute"}
         try:
-            Path(path).expanduser().mkdir(parents=True, exist_ok=True)
+            resolved.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             return {"ok": False, "error": str(exc)}
         self._prefs["scratch_base"] = path
@@ -2548,9 +4825,12 @@ class SessionManager:
                 self.unregister_session_client(session_id, cb)
 
     async def aclose(self) -> None:
+        await self.stop_team_worker()
+        await self.main_acp_host.aclose()
         await self.scheduler.stop()
         await self.stop_gateway()
         await self.mcp.aclose()
+        self.orchestrator.close()
         self.audit_store.close()
 
     # -- automation (scheduled tasks) -------------------------------------------
@@ -2851,9 +5131,29 @@ class SessionManager:
     async def _resume_wake(self, wake) -> None:
         await self.deliver_to_session(wake.session_id, self._wake_message(wake))
 
+    def _non_acp_delivery_state(self, session_id: str, delivery_id: str) -> str:
+        event_types = {
+            event.event_type
+            for event in self.orchestrator.store.list_events(
+                aggregate_type="session_delivery", aggregate_id=session_id
+            )
+            if str(event.payload.get("delivery_id")) == delivery_id
+        }
+        if "session.delivery.delivered" in event_types:
+            return "delivered"
+        if "session.delivery.prompting" in event_types:
+            return "unknown"
+        return "pending"
+
     async def deliver_to_session(
-        self, session_id: str, message: str, *, source: Optional[dict[str, Any]] = None
-    ) -> None:
+        self,
+        session_id: str,
+        message: str,
+        *,
+        source: Optional[dict[str, Any]] = None,
+        delivery_id: Optional[str] = None,
+        raise_on_error: bool = False,
+    ) -> Optional[dict[str, Any]]:
         """Deliver an out-of-band message to a (durable) session — the agent stays resumable
         forever, so this works with no live socket. Busy (mid tool-loop): steer it into the live
         turn at its next step (don't start a colliding run). Idle: run a fresh background turn
@@ -2861,12 +5161,81 @@ class SessionManager:
         by self-wake and channel-subscription delivery. `source` is the display-only MessageSource
         sidecar for connector messages (framed `message` stays the model-facing text).
         """
+        if self.is_main_acp_session(session_id):
+            result: Optional[dict[str, Any]] = None
+            source_task_id = "host"
+            if source:
+                source_task_id = str(
+                    source.get("connector")
+                    or source.get("platform")
+                    or source.get("task_id")
+                    or source.get("kind")
+                    or "host"
+                )
+            try:
+                result = await self.main_acp_host.deliver(
+                    session_id,
+                    message,
+                    source_task_id=source_task_id,
+                    delivery_id=delivery_id,
+                )
+                if raise_on_error and not result.get("delivered"):
+                    raise RuntimeError(
+                        "main ACP delivery outcome is "
+                        f"{result.get('state', 'unconfirmed')}; upstream delivery remains pending"
+                    )
+            except Exception as exc:
+                logger.warning("main ACP delivery failed for %s: %s", session_id, exc)
+                self.unrouted.record(session_id, "-", message, reason=str(exc))
+                await self.broadcast_session(
+                    session_id, {"type": "error", "data": {"error": str(exc)}}
+                )
+                if raise_on_error:
+                    raise
+            return result
         engine = self.get_engine(session_id)
         if engine is None:
-            return
+            if raise_on_error:
+                raise RuntimeError(f"target session is unavailable: {session_id}")
+            return None
+        if delivery_id:
+            existing_state = self._non_acp_delivery_state(session_id, delivery_id)
+            if existing_state != "pending":
+                return {
+                    "delivery_id": delivery_id,
+                    "state": existing_state,
+                    "delivered": existing_state == "delivered",
+                }
         if not self.try_mark_running(session_id):
+            if delivery_id:
+                # A durable team delivery waits for the current turn to finish. Do not also
+                # queue an in-memory steering message: doing both creates a replay window.
+                return {
+                    "delivery_id": delivery_id,
+                    "state": "pending",
+                    "delivered": False,
+                }
             engine.queue_steering(message, source)
-            return
+            return None
+        if delivery_id:
+            inserted = self.orchestrator.store.append_event(
+                {
+                    "event_id": f"session_delivery:{session_id}:{delivery_id}:prompting",
+                    "event_type": "session.delivery.prompting",
+                    "aggregate_type": "session_delivery",
+                    "aggregate_id": session_id,
+                    "payload": {"delivery_id": delivery_id},
+                }
+            )
+            if not inserted:
+                self.mark_idle(session_id)
+                state = self._non_acp_delivery_state(session_id, delivery_id)
+                return {
+                    "delivery_id": delivery_id,
+                    "state": state,
+                    "delivered": state == "delivered",
+                }
+        turn_failed = False
         try:
             async for event in engine.run(message, source=source):
                 # Stream every event to any socket viewing this session, so a background turn
@@ -2877,6 +5246,7 @@ class SessionManager:
                 # A background turn has no user watching to read an inline error: a dead model or
                 # tool failure would otherwise vanish. Log it and park it in the dead-letter store.
                 if event.type.value == "error":
+                    turn_failed = True
                     reason = (event.data or {}).get("error", "unknown error")
                     logger.warning(
                         "background turn failed for %s: %s", session_id, reason
@@ -2886,14 +5256,35 @@ class SessionManager:
         except (
             Exception
         ) as exc:  # an unexpected raise out of the turn must not be swallowed
+            turn_failed = True
             logger.warning("background turn crashed for %s: %s", session_id, exc)
             self.unrouted.record(session_id, "-", message, reason=str(exc))
             await self.broadcast_session(
                 session_id, {"type": "error", "data": {"error": str(exc)}}
             )
+            if raise_on_error:
+                raise
         finally:
             self.mark_idle(session_id)
             await self.broadcast_session(session_id, {"type": "turn_done", "data": {}})
+        if delivery_id:
+            if not turn_failed:
+                self.orchestrator.store.append_event(
+                    {
+                        "event_id": f"session_delivery:{session_id}:{delivery_id}:delivered",
+                        "event_type": "session.delivery.delivered",
+                        "aggregate_type": "session_delivery",
+                        "aggregate_id": session_id,
+                        "payload": {"delivery_id": delivery_id},
+                    }
+                )
+            state = self._non_acp_delivery_state(session_id, delivery_id)
+            return {
+                "delivery_id": delivery_id,
+                "state": state,
+                "delivered": state == "delivered",
+            }
+        return None
 
     # -- channel subscriptions (inbound messaging) ------------------------------
     async def _dispatch_inbound(self, event) -> None:
@@ -3124,8 +5515,12 @@ class SessionManager:
                 pass
             run.result_text = _last_assistant_text(engine.messages)
             run.artifacts = _recent_files(task.workspace, since=run.started_at)
-            run.status = "ok"
-            if task.notify_on_completion:
+            # A provider-level failure surfaces as an ERROR event, not an exception —
+            # the failed turn ends the transcript in an `error` notice (same signal
+            # finalize_manual_run uses for live manual runs).
+            run.error = _last_turn_error(engine.messages)
+            run.status = "error" if run.error else "ok"
+            if run.status == "ok" and task.notify_on_completion:
                 await self._notify_task_done(task, run)
         except Exception as exc:
             run.status, run.error = "error", str(exc)
@@ -3331,12 +5726,16 @@ class SessionManager:
             return {"ok": False, "error": "not found"}
         if run.status == "running":
             record = self.session_store.load(run.session_id)
-            run.result_text = _last_assistant_text(record.messages) if record else None
+            messages = record.messages if record else []
+            run.result_text = _last_assistant_text(messages)
             run.artifacts = _recent_files(task.workspace, since=run.started_at)
-            run.status = "ok"
+            # The GUI finalizes on ANY turn_done (errored turns included), so derive the
+            # outcome from the transcript tail: a failed turn ends in an `error` notice.
+            run.error = _last_turn_error(messages)
+            run.status = "error" if run.error else "ok"
             run.finished_at = _epoch()
             self.task_store.add_run(run)
-            task.last_run, task.last_status = run.finished_at, "ok"
+            task.last_run, task.last_status = run.finished_at, run.status
             task.run_count += 1
             self.task_store.save(task)
         return {"ok": True, "run": run.to_dict()}
@@ -3776,6 +6175,69 @@ class SessionManager:
         item = self.memory_store.add(content, scope=chosen, workspace=ws)
         return {"id": item.id, "scope": item.scope.value, "content": item.content}
 
+    def is_main_acp_session(self, session_id: str) -> bool:
+        if session_id in getattr(self.main_acp_host, "_runtimes", {}):
+            return True
+        record = self.session_store.load(session_id)
+        if record is not None and record.agent != "code":
+            return False
+        events = self.orchestrator.store.list_events(
+            aggregate_type="main_session", aggregate_id=session_id
+        )
+        return any(event.event_type == "main_session.bound" for event in events)
+
+    def add_audio_transcript_memory(self, body: dict[str, Any]) -> dict[str, Any]:
+        forbidden = {
+            "audio",
+            "blob",
+            "base64",
+            "file",
+            "bytes",
+            "raw",
+            "data_url",
+            "dataUrl",
+            "audio_blob",
+            "audioBlob",
+        }
+        present = sorted(key for key in forbidden if key in (body or {}))
+        if present:
+            return {
+                "ok": False,
+                "error": "audio transcript memory accepts text only",
+                "rejected_fields": present,
+            }
+        text = str((body or {}).get("text") or "").strip()
+        if not text:
+            return {"ok": False, "error": "text is required"}
+        if text.startswith("data:") or "base64," in text[:256]:
+            return {"ok": False, "error": "raw audio/base64 content is not accepted"}
+        scope_raw = str((body or {}).get("scope") or "workspace")
+        chosen = Scope(scope_raw) if scope_raw in _SCOPES else Scope.WORKSPACE
+        workspace = None
+        session_id = None
+        if chosen is Scope.WORKSPACE:
+            workspace = self.resolve_workspace((body or {}).get("workspace"))
+            if not workspace:
+                return {"ok": False, "error": "valid workspace is required"}
+        elif chosen is Scope.SESSION:
+            session_id = str((body or {}).get("session_id") or "").strip()
+            if not session_id:
+                return {"ok": False, "error": "session_id is required for session scope"}
+        item = self.memory_store.add(
+            text,
+            scope=chosen,
+            key=f"audio-transcript:{uuid.uuid4().hex}",
+            workspace=workspace,
+            session_id=session_id,
+        )
+        return {
+            "ok": True,
+            "id": item.id,
+            "scope": item.scope.value,
+            "content": item.content,
+            "key": item.key,
+        }
+
 
 def _parse_inbox_json(s: str) -> dict[str, Any]:
     """Parse a structured Inbox resolution (directory/plan carry their reply as a JSON string)."""
@@ -3813,6 +6275,20 @@ def _last_assistant_text(messages: list[dict[str, Any]]) -> Optional[str]:
     for msg in reversed(messages or []):
         if msg.get("role") == "assistant" and msg.get("content"):
             return msg["content"]
+    return None
+
+
+def _last_turn_error(messages: list[dict[str, Any]]) -> Optional[str]:
+    """The failure text if the transcript's LAST turn ended in an error, else None. The
+    engine persists a display-only `notice` message with kind "error" as the terminal
+    entry of a failed turn (engine._append_notice), so the tail decides; other trailing
+    notices (interrupted, model_switch) don't count as failure."""
+    for msg in reversed(messages or []):
+        if msg.get("role") == "notice":
+            if msg.get("kind") == "error":
+                return str(msg.get("text") or "turn failed")
+            continue
+        return None
     return None
 
 

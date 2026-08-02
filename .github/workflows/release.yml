@@ -10,7 +10,7 @@
 #   - manual run     → builds and uploads workflow artifacts only (no release).
 #
 # Each installer is uploaded twice: once with its versioned name (archive) and once with a
-# stable name (OpenWorker-macos-arm64.dmg, …) so the website can link to
+# stable name (QH-OpenWorker-macos-arm64.dmg, …) so the website can link to
 #   github.com/<repo>/releases/latest/download/<stable-name>
 # and never need updating.
 #
@@ -97,10 +97,6 @@ jobs:
           APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          # Auto-update artifact signing (minisign, separate from Apple signing). Absent →
-          # the build script skips updater artifacts with a warning (fork/scratch runs).
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           # Unset empty APPLE_* vars so runs without secrets stay cleanly unsigned
           # (Tauri treats a present-but-empty var as a config error).
@@ -117,32 +113,20 @@ jobs:
       - name: Build .msi + NSIS .exe (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: ./packaging/build_windows.ps1
 
-      - name: Stage artifacts (versioned + stable names)
+      - name: Stage QH artifacts (versioned + stable names)
         run: |
           mkdir -p out
           BUNDLE=surfaces/gui/src-tauri/target/release/bundle
           if [ "$RUNNER_OS" = "Windows" ]; then
             cp "$BUNDLE"/nsis/*.exe out/
-            cp "$BUNDLE"/nsis/*.exe out/OpenWorker-windows-setup.exe
+            cp "$BUNDLE"/nsis/*.exe out/QH-OpenWorker-windows-setup.exe
             cp "$BUNDLE"/msi/*.msi out/
-            cp "$BUNDLE"/msi/*.msi out/OpenWorker-windows.msi
-            # Updater signature for the NSIS installer (present only when the updater key
-            # secret is configured). The .sig signs CONTENT, so the stable rename is safe.
-            SIG=$(ls "$BUNDLE"/nsis/*.exe.sig 2>/dev/null | head -1 || true)
-            [ -n "$SIG" ] && cp "$SIG" out/OpenWorker-windows-setup.exe.sig
+            cp "$BUNDLE"/msi/*.msi out/QH-OpenWorker-windows.msi
           else
             cp "$BUNDLE"/dmg/*.dmg out/
-            cp "$BUNDLE"/dmg/*.dmg out/OpenWorker-${{ matrix.slug }}.dmg
-            # macOS updater artifact: the signed .app tarball the installed app swaps in.
-            if [ -f "$BUNDLE"/macos/OpenWorker.app.tar.gz ]; then
-              cp "$BUNDLE"/macos/OpenWorker.app.tar.gz out/OpenWorker-${{ matrix.slug }}.app.tar.gz
-              cp "$BUNDLE"/macos/OpenWorker.app.tar.gz.sig out/OpenWorker-${{ matrix.slug }}.app.tar.gz.sig
-            fi
+            cp "$BUNDLE"/dmg/*.dmg out/QH-OpenWorker-${{ matrix.slug }}.dmg
           fi
           ls -la out
 
@@ -166,12 +150,9 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Compose the auto-update manifest (latest.json)
-        # Shipped apps poll releases/latest/download/latest.json (via the branded
-        # download.openworker.com redirect) — publishing this release IS pushing the
-        # update. The tag must match tauri.conf.json's version or installed apps would
-        # see a permanent phantom update; fail loudly on drift. Runs only when signed
-        # updater artifacts exist (i.e. the TAURI_SIGNING_PRIVATE_KEY secret is set).
+      - name: Assert updater manifest is disabled
+        # QH OpenWorker has no updater endpoint/signing key yet. Do not generate or upload
+        # latest.json until qh owns both the endpoint and Tauri updater signing material.
         run: |
           TAG="${GITHUB_REF_NAME}"
           CONF_VERSION=$(python3 -c "import json; print(json.load(open('surfaces/gui/src-tauri/tauri.conf.json'))['version'])")
@@ -179,14 +160,8 @@ jobs:
             echo "::error::tag $TAG != tauri.conf.json version $CONF_VERSION — bump the config before tagging"
             exit 1
           fi
-          if ls dist/*.sig >/dev/null 2>&1; then
-            python3 packaging/make_update_manifest.py \
-              --version "${TAG#v}" --tag "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --dist dist --out dist/latest.json \
-              --notes "OpenWorker ${TAG#v}"
-          else
-            echo "::warning::no updater signatures in dist/ — release ships WITHOUT auto-update manifest"
-          fi
+          rm -f dist/latest.json
+          echo "::notice::QH updater is disabled; latest.json is intentionally not generated."
 
       - uses: softprops/action-gh-release@v2
         with:

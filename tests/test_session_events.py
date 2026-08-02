@@ -63,6 +63,26 @@ def test_deliver_broadcasts_turn_events(tmp_path):
     assert types[-1] == "turn_done"
 
 
+def test_team_delivery_to_non_acp_session_is_acknowledged_once(tmp_path):
+    provider = ScriptedProvider([_text("worker result")])
+    mgr = SessionManager(workspace=tmp_path, provider=provider)
+    mgr.get_engine("S", agent="chat")
+    mgr.enqueue_agent_delivery(
+        {
+            "conversation_id": "conversation-1",
+            "target_session_id": "S",
+            "source_task_id": "task-1",
+            "payload": {"summary": "worker finished"},
+            "delivery_id": "delivery-non-acp",
+        }
+    )
+
+    assert asyncio.run(mgr._drain_team_deliveries()) == 1
+    assert mgr.orchestrator.pending_deliveries("S") == []
+    assert asyncio.run(mgr._drain_team_deliveries()) == 0
+    assert provider._turns == []
+
+
 def test_deliver_broadcasts_to_multiple_clients(tmp_path):
     mgr = SessionManager(workspace=tmp_path, provider=ScriptedProvider([_text("yo")]))
     mgr.get_engine("S", agent="chat")

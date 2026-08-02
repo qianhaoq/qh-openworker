@@ -1,121 +1,76 @@
-import { test, expect } from "./fixtures";
+import { expect } from "@playwright/test";
+import { test } from "./fixtures";
 
-// Guards the Settings-as-page refactor (§13, IA per UX-021): the ⚙ menu opens a full-page
-// surface with a left sub-nav — General · Models · Voice input — and each section renders.
-// Files is a card inside General; Personas is launch-flagged off.
-test("Settings opens as a full page and navigates sections", async ({ page }) => {
-  await page.goto("/");
+// The Settings page: left sub-nav switching independent sections. 外观 is local-only;
+// 模型 rides /v1/settings + /v1/providers; 记忆 rides GET/POST /v1/memory (mock-mutated).
 
-  await page.getByTestId("account-row").click();
-  await page.getByRole("button", { name: "Settings", exact: true }).click();
+test("settings opens on 外观 and switches sections from the sub-nav", async ({ page }) => {
+  await page.goto("/#/settings");
+  // 外观 by default: theme radios render, sub-nav marks it current.
+  await expect(page.getByRole("radio", { name: "跟随系统" })).toBeVisible();
+  await expect(
+    page.getByRole("navigation", { name: "设置" }).getByRole("button", { name: "外观" }),
+  ).toHaveAttribute("aria-current", "page");
 
-  // Full-page: left sub-nav + the General section (no modal backdrop).
-  await expect(page.getByRole("heading", { name: "General" })).toBeVisible();
-  await expect(page.locator(".modal-backdrop")).toHaveCount(0);
-  for (const label of ["General", "Models", "Voice input"]) {
-    await expect(page.getByRole("button", { name: label, exact: true })).toBeVisible();
-  }
-  // Folded/hidden tabs: Files is a General card now; Personas is launch-flagged off.
-  await expect(page.getByRole("button", { name: "Files", exact: true })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Personas", exact: true })).toHaveCount(0);
-
-  // The Files card lives inside General.
-  await expect(page.getByText("Each conversation gets its own folder")).toBeVisible();
-
-  await page.getByRole("button", { name: "Models", exact: true }).click();
-  await expect(page.getByTestId("set-provider-openai")).toBeVisible();
+  await page.getByRole("navigation", { name: "设置" }).getByRole("button", { name: "模型" }).click();
+  await expect(page.getByText("模型提供商与默认模型", { exact: false }).first()).toBeVisible();
 });
 
-// The launch flag brings the Personas tab back (the gallery/persona suites rely on it).
-test("Settings: Personas tab returns behind the launch flag", async ({ page }) => {
-  await page.addInitScript(() => localStorage.setItem("ocw.flag.personas", "1"));
-  await page.goto("/");
-  await page.getByTestId("account-row").click();
-  await page.getByRole("button", { name: "Settings", exact: true }).click();
-  await page.getByRole("button", { name: "Personas", exact: true }).click();
-  await expect(page.getByText("Add personas")).toBeVisible();
+test("the models section renders providers and the default model", async ({ page }) => {
+  await page.goto("/#/settings");
+  await page.getByRole("navigation", { name: "设置" }).getByRole("button", { name: "模型" }).click();
+
+  // Providers in all three states (configured / configured-unused / unconfigured).
+  await expect(page.getByText("OpenAI", { exact: true })).toBeVisible();
+  await expect(page.getByText("Claude (Anthropic)", { exact: true })).toBeVisible();
+  await expect(page.getByText("Z AI (GLM)", { exact: true })).toBeVisible();
+  // The default model row shows the current selection from /v1/settings; the models list
+  // below shows the raw id (options in the select are hidden — match the visible row).
+  await expect(page.getByText("默认模型", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText(/anthropic:claude-opus-4-8/).first()).toBeVisible();
 });
 
-// UX-021: Settings ▸ Models is the shared provider gallery (§39 components). Cards wear
-// their own state (✓ Connected · used …); a vendor card opens the shared key form with the
-// prefilled endpoint behind the disclosure; unconfigured providers preview their models.
-test("Models: provider gallery states; vendor form previews models", async ({ page }) => {
-  await page.goto("/");
-  await page.getByTestId("account-row").click();
-  await page.getByRole("button", { name: "Settings", exact: true }).click();
-  await page.getByRole("button", { name: "Models", exact: true }).click();
+test("adding a model for an unconfigured provider shows a hint", async ({ page }) => {
+  await page.goto("/#/settings");
+  await page.getByRole("navigation", { name: "设置" }).getByRole("button", { name: "模型" }).click();
 
-  // Card states from the fixtures: openai configured+used, anthropic configured, zai not.
-  await expect(page.getByTestId("set-provider-openai")).toContainText("✓ Connected · used 2h ago");
-  await expect(page.getByTestId("set-provider-anthropic")).toContainText("✓ Connected");
-  await expect(page.getByTestId("set-provider-zai")).toContainText("Not set up");
-  await expect(page.getByTestId("set-provider-ollama")).toContainText("No key needed");
+  const input = page.getByPlaceholder("模型 ID,如 provider/model-name");
+  const addButton = page.getByRole("button", { name: "添加", exact: true });
 
-  // The composer-picker card lists the curated models with provider tags.
-  const picker = page.getByTestId("composer-picker");
-  await expect(picker).toContainText("In the composer's picker");
+  // Whitespace ids are rejected client-side, before any request.
+  await input.fill("bad model");
+  await addButton.click();
+  await expect(page.getByText("模型 ID 不能包含空格或空白字符")).toBeVisible();
 
-  // Vendor form: blurb renders; the prefilled endpoint hides behind the disclosure.
-  await page.getByTestId("set-provider-zai").click();
-  await expect(page.getByText(/Uses Z AI's OpenAI-compatible API/)).toBeVisible();
-  await page.getByTestId("set-endpoint-link").click();
-  await expect(page.getByTestId("set-field-base_url")).toHaveValue("https://api.z.ai/api/paas/v4");
+  // zai 未配置 → 已持久化但不出现在列表,提示说明原因。
+  await input.fill("zai:glm-5.2");
+  await addButton.click();
+  await expect(page.getByTestId("model-add-notice")).toContainText(
+    "已添加,配置对应提供商后才会出现在模型列表",
+  );
+  await expect(page.locator("span.font-mono", { hasText: "zai:glm-5.2" })).toHaveCount(0);
 
-  // Unconfigured providers still preview their curated models (read-only, matrix labels).
-  const preview = page.getByTestId("model-preview");
-  await expect(preview).toContainText("Included models");
-  await expect(preview).toContainText("GLM-5.2 · Z AI");
-
-  // Back to the gallery via the crumb.
-  await page.getByTestId("set-back").click();
-  await expect(page.getByTestId("set-provider-openai")).toBeVisible();
+  // openai 已配置 → 正常出现在列表,无提示。
+  await input.fill("openai:gpt-5.5-turbo");
+  await addButton.click();
+  await expect(page.locator("span.font-mono", { hasText: "openai:gpt-5.5-turbo" })).toHaveCount(1);
+  await expect(page.getByTestId("model-add-notice")).toBeHidden();
 });
 
-// UX-021: a configured provider's form shows the in-field saved state and the Remove key…
-// affordance; removing reverts the card to "Not set up".
-test("Models: Remove key reverts a configured provider", async ({ page }) => {
-  await page.goto("/");
-  page.on("dialog", (d) => d.accept());
-  await page.getByTestId("account-row").click();
-  await page.getByRole("button", { name: "Settings", exact: true }).click();
-  await page.getByRole("button", { name: "Models", exact: true }).click();
+test("adding a memory item lists it", async ({ page }) => {
+  await page.goto("/#/settings");
+  await page
+    .getByRole("navigation", { name: "设置" })
+    .getByRole("button", { name: "记忆" })
+    .click();
 
-  await page.getByTestId("set-provider-anthropic").click();
-  await expect(page.getByTestId("set-saved-pill")).toContainText("Tested & saved");
-  await page.getByTestId("set-remove-key").click();
+  // The seeded item renders.
+  await expect(page.getByText("回复默认使用中文", { exact: true })).toBeVisible();
+  await expect(page.getByText("已有记忆(1)", { exact: true })).toBeVisible();
 
-  // Back on the gallery, the card has forgotten its key.
-  await expect(page.getByTestId("set-provider-anthropic")).toContainText("Not set up");
-});
+  await page.getByPlaceholder("例如:回复一律使用简体中文").fill("周五下午不发版");
+  await page.getByRole("button", { name: "添加", exact: true }).click();
 
-// Token savings (owner ask 2026-07-17; moved under Models by UX-021): the card renders with
-// the PDF fallback segmented control + attach thresholds, and edits POST through.
-test("Settings: Token savings card edits PDF fallback and thresholds", async ({ page }) => {
-  await page.goto("/");
-  await page.getByTestId("account-row").click();
-  await page.getByRole("button", { name: "Settings", exact: true }).click();
-  await page.getByRole("button", { name: "Models", exact: true }).click();
-
-  const card = page.getByTestId("token-savings-card");
-  await expect(card).toBeVisible();
-  await expect(card.getByText("Token savings")).toBeVisible();
-
-  // Fallback mode: fixture says "text"; switching marks "Send page images" active.
-  const seg = page.getByTestId("pdf-fallback");
-  await expect(seg.getByRole("button", { name: "Extract text" })).toHaveClass(/active/);
-  const [req] = await Promise.all([
-    page.waitForRequest((r) => r.url().endsWith("/v1/settings/pdf") && r.method() === "POST"),
-    seg.getByRole("button", { name: "Send page images" }).click(),
-  ]);
-  expect(req.postDataJSON()).toEqual({ pdf_fallback: "images" });
-  await expect(seg.getByRole("button", { name: "Send page images" })).toHaveClass(/active/);
-
-  // Thresholds: fixture starts at 2 pages / 10 MB; editing pages POSTs the clamped value.
-  await expect(card.getByTestId("pdf-max-pages")).toHaveValue("2");
-  await expect(card.getByTestId("pdf-max-mb")).toHaveValue("10");
-  const [req2] = await Promise.all([
-    page.waitForRequest((r) => r.url().endsWith("/v1/settings/pdf") && r.method() === "POST"),
-    card.getByTestId("pdf-max-pages").fill("30"),
-  ]);
-  expect(req2.postDataJSON()).toEqual({ pdf_max_pages: 30 });
+  await expect(page.getByText("周五下午不发版", { exact: true })).toBeVisible();
+  await expect(page.getByText("已有记忆(2)", { exact: true })).toBeVisible();
 });

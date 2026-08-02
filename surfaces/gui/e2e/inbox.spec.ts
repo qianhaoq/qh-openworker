@@ -1,77 +1,51 @@
-import { test, expect } from "./fixtures";
+import { expect } from "@playwright/test";
+import { test } from "./fixtures";
 
-// The Inbox (owner testing pass, 2026-07-03; §28 two-tab split 2026-07-12): Pending holds the
-// kind chips (All/Approvals/Questions), persona filter chips (only with >1 persona holding
-// items), and resolve-removes-card. Routing moved to the Configure tab (the former Connectors ▸
-// Messaging routing page) — Pending's status line is read-only and links there; the old inline
-// editor (the mirror setting's SECOND editor) is gone.
+// The Inbox: pending approvals/questions from sessions, resolved inline (optimistic, then
+// re-aligned with the server). Fixtures seed one approval (Weekly plan 3) and one question
+// (ops session) — resolving one drops the sidebar badge from 2 to 1.
 
-async function openInbox(page: import("@playwright/test").Page) {
-  await page.goto("/");
-  // §26: the fixtures seed pending items, so the account row's inbox chip is unlocked and
-  // pending — clicking it goes STRAIGHT to Inbox (the menu is the row's target, not the chip's).
-  await page.getByTestId("inbox-chip").click();
-  await expect(page.getByText("Approve: run_shell")).toBeVisible();
-}
+test("pending items render with their kinds and actions", async ({ page }) => {
+  await page.goto("/#/inbox");
+  await expect(page.getByRole("heading", { name: "收件箱" })).toBeVisible();
+  await expect(page.getByRole("tab", { name: /待处理/ })).toContainText("2");
 
-test("kind + persona filters narrow the pending list", async ({ page }) => {
-  await openInbox(page);
-  const question = "Which environment should I restart?";
-  await expect(page.getByText(question)).toBeVisible();
-
-  const filters = page.getByTestId("inbox-filters");
-  await filters.getByRole("button", { name: "Approvals" }).click();
-  await expect(page.getByText(question)).not.toBeVisible();
-  await expect(page.getByText("Approve: run_shell")).toBeVisible();
-
-  await filters.getByRole("button", { name: "Questions" }).click();
-  await expect(page.getByText("Approve: run_shell")).not.toBeVisible();
-  await expect(page.getByText(question)).toBeVisible();
-
-  // Persona chips render because two personas hold items; filtering to Ops hides the cowork item.
-  await filters.getByRole("button", { name: "All", exact: true }).click();
-  await filters.getByRole("button", { name: "Ops", exact: true }).click();
-  await expect(page.getByText("Approve: run_shell")).not.toBeVisible();
-  await expect(page.getByText(question)).toBeVisible();
+  await expect(page.getByText("Approve: run_shell", { exact: true })).toBeVisible();
+  await expect(page.getByText("审批", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("Which environment should I restart?", { exact: true })).toBeVisible();
+  await expect(page.getByText("提问", { exact: true }).first()).toBeVisible();
+  // The question's quick options render as choices.
+  await expect(page.getByRole("button", { name: "staging", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "production", exact: true })).toBeVisible();
 });
 
-test("resolving an approval removes its card; question options resolve on click", async ({ page }) => {
-  await openInbox(page);
+test("allowing an approval moves it to 已处理 and updates the badge", async ({ page }) => {
+  await page.goto("/#/inbox");
+  await page.getByRole("button", { name: "允许", exact: true }).click();
 
-  await page.getByRole("button", { name: "Approve", exact: true }).click();
-  await expect(page.getByText("Approve: run_shell")).not.toBeVisible();
+  // Gone from pending; only the question remains.
+  await expect(page.getByText("Approve: run_shell", { exact: true })).toBeHidden();
+  await expect(page.getByText("Which environment should I restart?", { exact: true })).toBeVisible();
+  // The sidebar badge drops to 1.
+  await expect(page.getByRole("link", { name: /收件箱/ })).toContainText("1");
 
-  // Single-select question: clicking an option resolves immediately.
+  await page.getByRole("tab", { name: /已处理/ }).click();
+  await expect(page.getByText("Approve: run_shell", { exact: true })).toBeVisible();
+  await expect(page.getByText("已允许", { exact: true })).toBeVisible();
+});
+
+test("answering a question resolves it; clearing both empties the queue", async ({ page }) => {
+  await page.goto("/#/inbox");
   await page.getByRole("button", { name: "staging", exact: true }).click();
-  await expect(page.getByText("Which environment should I restart?")).not.toBeVisible();
-  await expect(page.getByText("Nothing pending.")).toBeVisible();
-});
 
-test("routing: Configure tab binds the mirror channel; Pending's status line follows", async ({
-  page,
-}) => {
-  await openInbox(page);
-  const line = page.getByTestId("inbox-routing");
-  await expect(line).toContainText("Delivered here only");
+  // The question is gone; the approval is still queued.
+  await expect(page.getByText("Which environment should I restart?", { exact: true })).toBeHidden();
+  await expect(page.getByText("Approve: run_shell", { exact: true })).toBeVisible();
 
-  // The status line is read-only — its Configure › link lands on the Configure tab, which
-  // holds the ONE editor (the old inline editor was a duplicate of this card).
-  await page.getByTestId("inbox-route-configure").click();
-  const mirror = page.getByTestId("inbox-mirror-card");
-  await expect(mirror).toContainText("in-app Inbox only");
-  await mirror.getByPlaceholder("slack:C0123 or channel link").fill("slack:T1DL/C0777");
-  await mirror.getByRole("button", { name: "Set", exact: true }).click();
-  await expect(mirror).toContainText("slack:T1DL/C0777");
+  await page.getByRole("button", { name: "允许", exact: true }).click();
+  await expect(page.getByText("没有待处理的事项", { exact: true })).toBeVisible();
 
-  // Back on Pending, the line reflects the new target immediately.
-  await page.getByTestId("inbox-tab-pending").click();
-  await expect(line).toContainText("slack:T1DL/C0777");
-  await expect(line).toContainText("replies there resolve items here");
-
-  // Clearing (also on Configure) returns Pending to local-only delivery.
-  await page.getByTestId("inbox-tab-configure").click();
-  await mirror.getByRole("button", { name: "clear" }).click();
-  await expect(mirror).toContainText("in-app Inbox only");
-  await page.getByTestId("inbox-tab-pending").click();
-  await expect(line).toContainText("Delivered here only");
+  await page.getByRole("tab", { name: /已处理/ }).click();
+  await expect(page.getByText("Which environment should I restart?", { exact: true })).toBeVisible();
+  await expect(page.getByText("已回答:staging", { exact: true })).toBeVisible();
 });

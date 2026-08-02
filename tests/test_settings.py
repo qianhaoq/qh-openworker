@@ -174,3 +174,77 @@ def test_ollama_models_gated_on_liveness(tmp_path, monkeypatch):
 
     monkeypatch.setattr(SessionManager, "_ollama_alive", lambda self: True)
     assert "ollama:llama3.3" in manager.get_settings()["models"]
+
+
+def test_add_model_rejects_malformed_ids(tmp_path, monkeypatch):
+    """Live-audit #9: the model list persisted ANY string (even 'AUDIT BAD MODEL' with
+    spaces). Plausible ids (provider:model or bare) are accepted — including ids whose
+    provider isn't configured — but whitespace/control-char/oversized junk is refused
+    and never persisted."""
+    from coworker.server.manager import SessionManager
+
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+    manager = SessionManager(data_dir=tmp_path / "data")
+
+    # accepted: bare id, provider:model, and an unconfigured provider's id
+    for good in ("gpt-4o-custom", "openai:audit-model", "ollama:qwen2.5-coder:32b"):
+        assert manager.add_model(good)["ok"] is True, good
+
+    # refused: whitespace anywhere, control chars, >200 chars, blank
+    for bad in ("AUDIT BAD MODEL", "tab\tmodel", "new\nline", "x" * 201, " \t "):
+        out = manager.add_model(bad)
+        assert out["ok"] is False and out["error"], bad
+    assert manager.add_model("AUDIT BAD MODEL")["error"].startswith("invalid model id")
+    assert manager.add_model("")["error"] == "empty model"
+
+    # only the good ids were persisted
+    assert manager._prefs["models"] == [
+        "gpt-4o-custom",
+        "openai:audit-model",
+        "ollama:qwen2.5-coder:32b",
+    ]
+
+
+def test_models_add_rest_rejects_junk(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from coworker.server.app import create_app
+    from coworker.server.manager import SessionManager
+
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+    client = TestClient(create_app(SessionManager(data_dir=tmp_path / "data")))
+
+    bad = client.post("/v1/settings/models/add", json={"model": "AUDIT BAD MODEL"})
+    assert bad.json()["ok"] is False and bad.json()["error"].startswith(
+        "invalid model id"
+    )
+    good = client.post("/v1/settings/models/add", json={"model": "openai:audit-model"})
+    assert good.json()["ok"] is True
+
+
+def test_scratch_base_rejects_relative_path(tmp_path, monkeypatch):
+    """Live-audit #10: a relative 会话文件夹 used to be created under the SERVER's CWD —
+    an effectively random location. Require an absolute path (after ~ expansion)."""
+    from fastapi.testclient import TestClient
+
+    from coworker.server.app import create_app
+    from coworker.server.manager import SessionManager
+
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))  # keep ~ expansion out of $HOME
+    client = TestClient(create_app(SessionManager(data_dir=tmp_path / "data")))
+
+    out = client.post(
+        "/v1/settings/scratch-base", json={"path": "audit-rel-path-xyz/nested"}
+    ).json()
+    assert out["ok"] is False and out["error"] == "path must be absolute"
+    # nothing was created — neither under the server CWD nor as a stored pref
+    assert not Path("audit-rel-path-xyz").exists()
+    assert client.get("/v1/settings").json()["scratch_base"] == "~/OpenWorker"
+
+    # absolute and ~-anchored paths still work
+    ok = client.post(
+        "/v1/settings/scratch-base", json={"path": "~/scratch-here"}
+    ).json()
+    assert ok["ok"] is True
+    assert (tmp_path / "home" / "scratch-here").is_dir()

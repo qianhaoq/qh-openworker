@@ -8,7 +8,27 @@ import subprocess
 import sys
 import time
 
-from coworker.secrets import SecretStore
+from coworker.secrets import SecretStore, state_dir
+
+
+def test_state_dir_prefers_qh_override_then_legacy(monkeypatch, tmp_path):
+    qh = tmp_path / "qh"
+    legacy = tmp_path / "legacy"
+    monkeypatch.setenv("QH_OPENWORKER_STATE_DIR", str(qh))
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(legacy))
+    assert state_dir() == qh
+
+    monkeypatch.delenv("QH_OPENWORKER_STATE_DIR")
+    assert state_dir() == legacy
+
+
+def test_state_dir_default_is_qh_openworker_on_posix(monkeypatch, tmp_path):
+    if sys.platform == "win32":
+        return
+    monkeypatch.delenv("QH_OPENWORKER_STATE_DIR", raising=False)
+    monkeypatch.delenv("COWORKER_STATE_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert state_dir() == tmp_path / ".config" / "qh-openworker"
 
 
 def test_put_get_round_trip(tmp_path):

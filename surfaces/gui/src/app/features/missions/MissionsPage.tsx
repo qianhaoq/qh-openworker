@@ -1,0 +1,289 @@
+// 任务页面 — 多 Agent 协作任务的列表(#/missions)与详情(#/missions/:id)之间的路由开关。
+// 列表:状态筛选 chips + 任务行 + 「新建任务」drawer(目标 → 创建 → 直达详情页确认计划)。
+
+import { useEffect, useState, type FormEvent } from "react";
+import { Icon } from "../../components/Icon";
+import { navigate, useRoute } from "../../nav";
+import { listAgentProfiles } from "../../lib/api/agents";
+import type { AgentProfile, Mission } from "../../lib/api/types";
+import { humanizeErrorText } from "../../lib/errorText";
+import { hasUsableExecutor } from "../agents/agentLogic";
+import { MissionDetailPage } from "./MissionDetailPage";
+import {
+  MISSION_FILTERS,
+  formatTime,
+  missionMatchesFilter,
+  missionTitle,
+  sortMissionsByUpdated,
+  stateMeta,
+  type MissionFilter,
+} from "./missionLogic";
+import { useMissions } from "./useMissions";
+
+const GRP =
+  "overflow-hidden rounded-xl bg-panel shadow-[0_0_0_0.5px_var(--line-strong),0_1px_2px_rgba(0,0,0,0.04)]";
+
+export function MissionsPage() {
+  const route = useRoute();
+  const missionId = route.params.missionId;
+  if (missionId) return <MissionDetailPage key={missionId} missionId={missionId} />;
+  return <MissionListPage />;
+}
+
+function MissionRow({ mission, onOpen }: { mission: Mission; onOpen: () => void }) {
+  const meta = stateMeta(mission.state);
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={onOpen}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onOpen();
+        }
+      }}
+      className="flex w-full cursor-pointer items-center gap-3 px-4 py-3 text-left hover:bg-paper/50"
+    >
+      <span className={`shrink-0 rounded px-1.5 py-0.5 text-[10.5px] font-semibold ${meta.tint}`}>
+        {meta.label}
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-[13px] font-medium">{missionTitle(mission)}</span>
+        <span className="mt-0.5 block text-[11.5px] text-faint">
+          {mission.members.length} 个席位 · 更新于 {formatTime(mission.updated_at ?? mission.created_at)}
+        </span>
+      </span>
+      <Icon name="chevronRight" size={14} className="shrink-0 text-faint" />
+    </div>
+  );
+}
+
+function CreateMissionDrawer({
+  creating,
+  onClose,
+  onCreate,
+}: {
+  creating: boolean;
+  onClose: () => void;
+  onCreate: (goal: string) => Promise<string | null>;
+}) {
+  const [goal, setGoal] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  // Pre-check: creating needs an enabled + probed executor profile (the backend 400s
+  // with a cryptic message otherwise). null = still loading / load failed — don't gate.
+  const [profiles, setProfiles] = useState<AgentProfile[] | null>(null);
+
+  useEffect(() => {
+    let stale = false;
+    listAgentProfiles()
+      .then((list) => !stale && setProfiles(list))
+      .catch(() => {});
+    return () => {
+      stale = true;
+    };
+  }, []);
+
+  const executorMissing = profiles !== null && !hasUsableExecutor(profiles);
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!goal.trim() || creating || executorMissing) return;
+    setError(null);
+    const failure = await onCreate(goal);
+    // The raw 400 can still slip through (profile flipped between load and submit).
+    if (failure) setError(humanizeErrorText(failure));
+  };
+
+  return (
+    <>
+      <div className="fixed inset-0 z-30 bg-black/20" onClick={onClose} aria-hidden="true" />
+      <aside
+        className="fixed inset-y-0 right-0 z-40 flex w-[440px] max-w-full flex-col border-l border-line bg-paper shadow-2xl"
+        role="dialog"
+        aria-label="新建任务"
+      >
+        <div className="flex items-center justify-between border-b border-line bg-panel px-4 py-3">
+          <div className="text-[13.5px] font-semibold tracking-tight">新建任务</div>
+          <button
+            type="button"
+            onClick={onClose}
+            title="关闭"
+            className="grid h-6 w-6 place-items-center rounded text-faint hover:bg-paper hover:text-ink"
+          >
+            <Icon name="close" size={14} />
+          </button>
+        </div>
+        <form onSubmit={(event) => void submit(event)} className="flex flex-1 flex-col p-4">
+          <p className="text-[12.5px] leading-relaxed text-muted">
+            描述目标后,主 Agent 会提出结构化的团队计划;你确认前不会启动任何写入型执行。
+          </p>
+          <label htmlFor="mission-goal" className="mb-1.5 mt-5 text-[12px] font-semibold text-muted">
+            目标
+          </label>
+          <textarea
+            id="mission-goal"
+            value={goal}
+            onChange={(event) => setGoal(event.target.value)}
+            placeholder="例如:让 Kimi 做 UI,OpenCode 实现,Reviewer 做只读审查"
+            rows={6}
+            autoFocus
+            className="w-full resize-none rounded-lg border border-line bg-panel px-3 py-2 text-[13px] leading-relaxed outline-none placeholder:text-faint focus:border-lineStrong"
+          />
+          {error && (
+            <p className="mt-2 text-[12px] text-danger" role="alert">
+              {error}
+            </p>
+          )}
+          {executorMissing && (
+            <div
+              className="mt-3 rounded-lg bg-warnSoft px-3 py-2 text-[12.5px] leading-relaxed text-warnInk"
+              data-testid="executor-missing-notice"
+            >
+              需要先在 Agents 页招募并启用一个「执行」角色的 agent,才能创建任务。
+              <button
+                type="button"
+                onClick={() => navigate("agents")}
+                className="mt-1.5 flex items-center gap-1 rounded-md border border-warnInk/30 px-2 py-0.5 text-[11.5px] font-medium hover:opacity-80"
+              >
+                前往 Agents
+                <Icon name="chevronRight" size={12} />
+              </button>
+            </div>
+          )}
+          <div className="mt-auto flex justify-end gap-2 pt-4">
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-lg border border-line bg-panel px-3.5 py-1.5 text-[12.5px] hover:border-lineStrong"
+            >
+              取消
+            </button>
+            <button
+              type="submit"
+              disabled={!goal.trim() || creating || executorMissing}
+              title={executorMissing ? "需要先在 Agents 页启用一个「执行」角色的 agent" : undefined}
+              className="flex items-center gap-1.5 rounded-lg bg-accent px-3.5 py-1.5 text-[12.5px] font-medium text-white hover:brightness-105 disabled:opacity-40"
+            >
+              {creating ? <span className="spinner" /> : <Icon name="sparkle" size={14} />}
+              创建任务
+            </button>
+          </div>
+        </form>
+      </aside>
+    </>
+  );
+}
+
+function MissionListPage() {
+  const { missions, loading, loadError, creating, refresh, create } = useMissions();
+  const [filter, setFilter] = useState<MissionFilter>("all");
+  const [composing, setComposing] = useState(false);
+
+  const filtered = sortMissionsByUpdated(missions.filter((mission) => missionMatchesFilter(mission, filter)));
+
+  const createAndOpen = async (goal: string): Promise<string | null> => {
+    try {
+      const mission = await create(goal);
+      navigate(`missions/${encodeURIComponent(mission.mission_id)}`);
+      return null;
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  };
+
+  return (
+    <div data-tauri-drag-region className="mx-auto max-w-3xl px-8 py-8">
+      <header data-tauri-drag-region className="flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-[22px] font-semibold tracking-tight">任务</h1>
+          <p className="mt-1 text-[13px] text-muted">
+            把目标交给可审计的本地 Agent 团队:先确认计划,再跟踪执行、审查与交付。
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => setComposing(true)}
+          className="flex shrink-0 items-center gap-1.5 rounded-lg bg-accent px-3.5 py-1.5 text-[13px] font-medium text-white hover:brightness-105"
+        >
+          <Icon name="plus" size={14} />
+          新建任务
+        </button>
+      </header>
+
+      <div className="mt-5 flex items-center gap-1" role="tablist" aria-label="任务状态筛选">
+        {MISSION_FILTERS.map((item) => (
+          <button
+            key={item.id}
+            type="button"
+            role="tab"
+            aria-selected={filter === item.id}
+            onClick={() => setFilter(item.id)}
+            className={`rounded-md px-2.5 py-1 text-[12.5px] ${
+              filter === item.id
+                ? "bg-accentSoft font-medium text-accent"
+                : "text-muted hover:bg-panel hover:text-ink"
+            }`}
+          >
+            {item.label}
+          </button>
+        ))}
+      </div>
+
+      {loading ? (
+        <div className="flex items-center justify-center gap-2 py-20 text-[13px] text-faint">
+          <span className="spinner spinner-lg" /> 加载中
+        </div>
+      ) : loadError ? (
+        <div className="py-20 text-center">
+          <p className="text-[13px] text-danger">{loadError}</p>
+          <button
+            type="button"
+            onClick={() => void refresh().catch(() => {})}
+            className="mt-3 rounded-lg border border-line bg-panel px-3.5 py-1.5 text-[12.5px] hover:border-lineStrong"
+          >
+            重试
+          </button>
+        </div>
+      ) : filtered.length === 0 ? (
+        <div className="flex flex-col items-center py-16 text-center">
+          <div className="grid h-11 w-11 place-items-center rounded-xl2 bg-accentSoft text-accent">
+            <Icon name="missions" size={20} />
+          </div>
+          <h2 className="mt-4 text-[15px] font-semibold tracking-tight">
+            {missions.length === 0 ? "还没有任务" : "没有匹配的任务"}
+          </h2>
+          <p className="mt-1.5 max-w-sm text-[13px] leading-relaxed text-muted">
+            {missions.length === 0
+              ? "新建一个任务,主 Agent 会先提出团队计划,确认后开始执行。"
+              : "切换上方筛选,或新建一个任务。"}
+          </p>
+          {missions.length === 0 && (
+            <button
+              type="button"
+              onClick={() => setComposing(true)}
+              className="mt-5 flex items-center gap-1.5 rounded-lg bg-accent px-3.5 py-1.5 text-[13px] font-medium text-white hover:brightness-105"
+            >
+              <Icon name="plus" size={14} />
+              新建任务
+            </button>
+          )}
+        </div>
+      ) : (
+        <div className={`${GRP} mt-3 divide-y divide-line`}>
+          {filtered.map((mission) => (
+            <MissionRow
+              key={mission.mission_id}
+              mission={mission}
+              onOpen={() => navigate(`missions/${encodeURIComponent(mission.mission_id)}`)}
+            />
+          ))}
+        </div>
+      )}
+
+      {composing && (
+        <CreateMissionDrawer creating={creating} onClose={() => setComposing(false)} onCreate={createAndOpen} />
+      )}
+    </div>
+  );
+}

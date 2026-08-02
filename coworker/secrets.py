@@ -2,7 +2,8 @@
 
 Design (from OpenClaw): secrets **never enter the model's context, prompts, or traces**.
 The store holds profiles keyed by `connector[:account]`; values may be literals OR
-`${ENV_VAR}` references resolved at read time from the process env / `~/.config/coworker/.env`.
+`${ENV_VAR}` references resolved at read time from the process env /
+`~/.config/qh-openworker/.env`.
 
 v1 is a `0600` JSON file behind this interface; the interface is what callers depend on, so
 a Keychain / age-encrypted backend can swap in later without touching them.
@@ -25,22 +26,24 @@ _IS_WINDOWS = sys.platform == "win32"
 
 
 def state_dir() -> Path:
-    """Where coworker keeps its state — the one cross-platform source of truth.
+    """Where QH OpenWorker keeps its state — the one cross-platform source of truth.
 
     Resolution order:
-    1. `$COWORKER_STATE_DIR` — explicit override on any OS (used by tests/sidecars).
-    2. Windows: `%APPDATA%\\coworker` (e.g. `C:\\Users\\You\\AppData\\Roaming\\coworker`),
-       the native per-user app-data location.
-    3. macOS / Linux: `~/.config/coworker` (XDG-style, unchanged from prior behavior).
+    1. `$QH_OPENWORKER_STATE_DIR` — explicit qh fork override on any OS.
+    2. `$COWORKER_STATE_DIR` — legacy/upstream-compatible override used by tests/sidecars.
+    3. Windows: `%APPDATA%\\qh-openworker`.
+    4. macOS / Linux: `~/.config/qh-openworker`.
     """
-    base = os.environ.get("COWORKER_STATE_DIR")
+    base = os.environ.get("QH_OPENWORKER_STATE_DIR") or os.environ.get(
+        "COWORKER_STATE_DIR"
+    )
     if base:
         return Path(base).expanduser()
     if sys.platform == "win32":
         appdata = os.environ.get("APPDATA")
         if appdata:
-            return Path(appdata) / "coworker"
-    return Path.home() / ".config" / "coworker"
+            return Path(appdata) / "qh-openworker"
+    return Path.home() / ".config" / "qh-openworker"
 
 
 def _load_dotenv(path: Path) -> dict[str, str]:

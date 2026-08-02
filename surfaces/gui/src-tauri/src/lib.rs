@@ -1,4 +1,4 @@
-//! OpenWorker desktop shell.
+//! QH 助理 desktop shell (qh-openworker product identity).
 //!
 //! Tauri is a thin native window over the existing React SPA. It:
 //!   1. picks a free localhost port and starts the Python `openworker-server` as a managed
@@ -91,19 +91,23 @@ fn server_bin() -> PathBuf {
 }
 
 /// Mirror of `coworker.secrets.state_dir()` so the shell and server agree on `desktop.json`.
-/// Windows: `%APPDATA%\coworker`; POSIX: `~/.config/coworker`. `COWORKER_STATE_DIR` overrides.
+/// Windows: `%APPDATA%\qh-openworker`; POSIX: `~/.config/qh-openworker`.
+/// `QH_OPENWORKER_STATE_DIR` overrides first; legacy `COWORKER_STATE_DIR` remains supported.
 fn state_dir() -> PathBuf {
+    if let Ok(d) = std::env::var("QH_OPENWORKER_STATE_DIR") {
+        return PathBuf::from(d);
+    }
     if let Ok(d) = std::env::var("COWORKER_STATE_DIR") {
         return PathBuf::from(d);
     }
     #[cfg(windows)]
     {
         if let Ok(appdata) = std::env::var("APPDATA") {
-            return PathBuf::from(appdata).join("coworker");
+            return PathBuf::from(appdata).join("qh-openworker");
         }
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".config").join("coworker")
+    PathBuf::from(home).join(".config").join("qh-openworker")
 }
 
 fn desktop_prefs_path() -> PathBuf {
@@ -482,12 +486,10 @@ fn show_main(app: &tauri::AppHandle) {
     }
 }
 
-// --- Auto-update (tauri-plugin-updater) -------------------------------------------
-// The GUI drives updates through these commands (same invoke bridge as everything
-// else — no global plugin JS): check, background pre-download, install. Update
-// artifacts are minisign-verified against the pubkey in tauri.conf.json before
-// anything is installed; the manifest lives at the endpoints configured there
-// (download.openworker.com → GitHub Releases).
+// --- Auto-update ---------------------------------------------------------------
+// This fork deliberately ships with updater disabled until qh-owned endpoints, signing
+// keys, and release process exist. Keeping the invoke commands as no-ops preserves the
+// current GUI bridge without ever checking or installing upstream OpenWorker builds.
 
 #[derive(serde::Serialize)]
 struct UpdateInfo {
@@ -496,14 +498,8 @@ struct UpdateInfo {
 }
 
 #[tauri::command]
-async fn check_for_update(app: tauri::AppHandle) -> Result<Option<UpdateInfo>, String> {
-    use tauri_plugin_updater::UpdaterExt;
-    let updater = app.updater().map_err(|e| e.to_string())?;
-    let update = updater.check().await.map_err(|e| e.to_string())?;
-    Ok(update.map(|u| UpdateInfo {
-        version: u.version.clone(),
-        notes: u.body.clone().unwrap_or_default(),
-    }))
+async fn check_for_update(_app: tauri::AppHandle) -> Result<Option<UpdateInfo>, String> {
+    Ok(None)
 }
 
 /// Update bytes pre-fetched by `download_update`, keyed by version. The GUI kicks the
@@ -513,28 +509,10 @@ struct PendingUpdate(Mutex<Option<(String, Vec<u8>)>>);
 
 #[tauri::command]
 async fn download_update(
-    app: tauri::AppHandle,
-    pending: tauri::State<'_, PendingUpdate>,
+    _app: tauri::AppHandle,
+    _pending: tauri::State<'_, PendingUpdate>,
 ) -> Result<(), String> {
-    use tauri_plugin_updater::UpdaterExt;
-    let updater = app.updater().map_err(|e| e.to_string())?;
-    let Some(update) = updater.check().await.map_err(|e| e.to_string())? else {
-        return Err("no update available".into());
-    };
-    // Periodic re-checks re-invoke this for the same release — the cached bytes stand.
-    // (Guard scope stays sync: a std MutexGuard must not live across an await.)
-    {
-        let slot = pending.0.lock().unwrap();
-        if slot.as_ref().map(|(v, _)| v == &update.version).unwrap_or(false) {
-            return Ok(());
-        }
-    }
-    let bytes = update
-        .download(|_, _| {}, || {})
-        .await
-        .map_err(|e| e.to_string())?;
-    *pending.0.lock().unwrap() = Some((update.version.clone(), bytes));
-    Ok(())
+    Err("updates are disabled for this qh-openworker fork".into())
 }
 
 /// Drop the pre-fetched bundle. Invoked on "Later": a dismissed release would
@@ -547,34 +525,10 @@ fn clear_pending_update(pending: tauri::State<'_, PendingUpdate>) {
 
 #[tauri::command]
 async fn install_update(
-    app: tauri::AppHandle,
-    pending: tauri::State<'_, PendingUpdate>,
+    _app: tauri::AppHandle,
+    _pending: tauri::State<'_, PendingUpdate>,
 ) -> Result<(), String> {
-    use tauri_plugin_updater::UpdaterExt;
-    let updater = app.updater().map_err(|e| e.to_string())?;
-    let Some(update) = updater.check().await.map_err(|e| e.to_string())? else {
-        return Err("no update available".into());
-    };
-    // Pre-fetched bytes for this exact version install instantly; a stale or missing
-    // cache falls back to the original blocking download-and-install.
-    let cached = {
-        let mut slot = pending.0.lock().unwrap();
-        match slot.take() {
-            Some((v, bytes)) if v == update.version => Some(bytes),
-            _ => None,
-        }
-    };
-    match cached {
-        Some(bytes) => update.install(bytes).map_err(|e| e.to_string())?,
-        None => update
-            .download_and_install(|_, _| {}, || {})
-            .await
-            .map_err(|e| e.to_string())?,
-    }
-    // Windows never reaches here (the NSIS installer takes over and relaunches).
-    // macOS: the .app was swapped in place — restart into the new version. The tray
-    // Exit path's sidecar kill runs via RunEvent, so no orphaned openworker-server.
-    app.restart();
+    Err("updates are disabled for this qh-openworker fork".into())
 }
 
 pub fn run() {
@@ -597,7 +551,6 @@ pub fn run() {
             show_main(app);
         }))
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
@@ -690,7 +643,7 @@ pub fn run() {
             //    Overlay title bar (macOS): traffic lights float over the edge-to-edge UI.
             let mut builder =
                 WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-                    .title("OpenWorker")
+                    .title("QH 助理")
                     .inner_size(1360.0, 900.0)
                     .min_inner_size(980.0, 640.0)
                     // Let the WEBVIEW receive OS file drags: Tauri's own drag-drop handler
@@ -722,16 +675,16 @@ pub fn run() {
             });
 
             // 3. System tray: Open / Settings / Quit.
-            let open_i = MenuItem::with_id(app, "open", "Open OpenWorker", true, None::<&str>)?;
-            let settings_i = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
-            let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            let open_i = MenuItem::with_id(app, "open", "打开 QH 助理", true, None::<&str>)?;
+            let settings_i = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
+            let quit_i = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open_i, &settings_i, &quit_i])?;
 
             // A monochrome template icon (black + alpha, raw RGBA 44×44) so the menu bar tints
             // it for light/dark automatically — not the full-color app icon.
             let tray_icon = tauri::image::Image::new(include_bytes!("../icons/tray.rgba"), 44, 44);
             TrayIconBuilder::new()
-                .tooltip("OpenWorker")
+                .tooltip("QH 助理")
                 .icon(tray_icon)
                 .icon_as_template(true)
                 .menu(&menu)
@@ -753,7 +706,7 @@ pub fn run() {
             Ok(())
         })
         .build(tauri::generate_context!())
-        .expect("error while building the OpenWorker desktop app")
+        .expect("error while building the QH 助理 desktop app")
         .run(|app, event| {
             // Also on Exit: belt-and-suspenders in case a quit path reaches teardown without
             // a preceding ExitRequested (observed with macOS Cmd+Q under the tray setup).

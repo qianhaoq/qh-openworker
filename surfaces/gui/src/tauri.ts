@@ -61,7 +61,7 @@ export async function pickFolder(): Promise<string | null> {
  * owner report 2026-07-04: "Browse" was desktop-only and the browser had paste-a-path only). */
 export async function chooseFolder(): Promise<string | null> {
   if (isTauri()) return pickFolder();
-  const { pickFolderViaServer } = await import("./api");
+  const { pickFolderViaServer } = await import("./app/lib/api/sessions");
   return pickFolderViaServer();
 }
 

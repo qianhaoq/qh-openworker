@@ -3,7 +3,7 @@
 #
 #   1. PyInstaller-bundle the server into a standalone onedir folder (no venv at runtime).
 #   2. Stage it at binaries/sidecar/ for Tauri's `resources` slot (+ sign its Mach-Os).
-#   3. `tauri build --bundles app` → OpenWorker.app (resources are copied in).
+#   3. `tauri build --bundles app` → QH 助理.app (resources are copied in).
 #   4. Wrap the .app in a compressed .dmg via hdiutil (reliable + headless; Tauri's own
 #      bundle_dmg.sh uses Finder AppleScript and fails in non-interactive sessions).
 #
@@ -21,7 +21,7 @@
 # `tauri build` signs the .app + the bundled sidecar with it. Left unset → UNSIGNED (first launch
 # needs right-click → Open).
 #
-# NOTARIZATION (step 5, runs only when the identity is set): signs the .dmg CONTAINER, submits
+# NOTARIZATION (step 5, runs only when the qh-owned identity is set): signs the .dmg CONTAINER, submits
 # to Apple's notary service, staples the ticket, and verifies with spctl. Signing alone is NOT
 # enough for public downloads — un-notarized apps get macOS's "Apple could not verify… Move to
 # Trash?" dialog. Auth is an App Store Connect API key via NOTARYTOOL_API_KEY_PATH /
@@ -40,7 +40,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PLATFORM="$(cd "$HERE/.." && pwd)"
 GUI="$PLATFORM/surfaces/gui"
-APP="OpenWorker"
+APP="QH 助理"
+ARTIFACT_PREFIX="QH-OpenWorker"
 # Single source of truth for the version: tauri.conf.json (also stamps the bundle).
 VERSION="$(node -p "require('$GUI/src-tauri/tauri.conf.json').version")"
 TRIPLE="$(rustc -vV | sed -n 's/host: //p')"   # e.g. aarch64-apple-darwin
@@ -128,25 +129,8 @@ if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
 fi
 
 echo "==> [3/5] tauri build (.app)"
-# Auto-update artifacts (.app.tar.gz + minisign .sig): produced only when the updater
-# signing key is available — from the env (CI secret TAURI_SIGNING_PRIVATE_KEY), or from
-# `.ocw-updater.env` one directory above the repo (same convention as the notary env).
-# Keyless builds skip the overlay entirely so dev/fork builds keep working; keyless
-# RELEASES would strand every install without auto-update, hence the loud warning.
-UPDATER_ENV="${OCW_UPDATER_ENV:-$PLATFORM/../.ocw-updater.env}"
-if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ] && [ -f "$UPDATER_ENV" ]; then
-  # shellcheck disable=SC1090
-  source "$UPDATER_ENV"
-fi
-UPDATER_OVERLAY=()
-if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
-  UPDATER_OVERLAY=(--config '{"bundle":{"createUpdaterArtifacts":true}}')
-else
-  echo "    WARNING: no updater signing key — building WITHOUT auto-update artifacts (not releasable)."
-fi
-# ${arr[@]+…} guard: plain "${arr[@]}" on an EMPTY array is an "unbound variable"
-# under set -u on macOS's stock bash 3.2 — hit by keyless (fresh-clone) builds.
-( cd "$GUI" && npm run tauri build -- --bundles app ${UPDATER_OVERLAY[@]+"${UPDATER_OVERLAY[@]}"} )
+echo "    updater artifacts disabled for qh-openworker (no latest.json/.sig generation)."
+( cd "$GUI" && npm run tauri build -- --bundles app )
 
 echo "==> [4/5] hdiutil: wrapping into .dmg"
 BUNDLE="$GUI/src-tauri/target/release/bundle"
@@ -158,7 +142,7 @@ ln -s /Applications "$STAGING/Applications"
 # be upscaled and look hazy/pixelated.
 mkdir "$STAGING/.background"
 cp "$HERE/dmg-background.tiff" "$STAGING/.background/bg.tiff"
-DMG="$BUNDLE/dmg/${APP}_${VERSION}_${ARCH}.dmg"
+DMG="$BUNDLE/dmg/${ARTIFACT_PREFIX}_${VERSION}_${ARCH}.dmg"
 mkdir -p "$(dirname "$DMG")"
 rm -f "$DMG"
 

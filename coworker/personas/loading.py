@@ -64,5 +64,12 @@ def clone_persona_repo(
     """Clone (or reuse) a persona repo under ``base`` and return its directory."""
     dest = cache_dir_for(url, base)
     if not dest.is_dir():
-        clone(url, dest)
+        try:
+            clone(url, dest)
+        except (subprocess.CalledProcessError, OSError) as exc:
+            # CalledProcessError's str() embeds the full clone command incl. the local
+            # cache path — never surface that to the user.
+            raise RuntimeError(
+                "Failed to clone repository. Check the URL and network access."
+            ) from exc
     return dest

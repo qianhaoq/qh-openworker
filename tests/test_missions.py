@@ -1,0 +1,356 @@
+import json
+from types import SimpleNamespace
+
+from fastapi.testclient import TestClient
+import pytest
+
+from coworker.orchestration import AgentProfile, OrchestrationStoreError, TaskStatus
+from coworker.orchestrator import QhOrchestratorStore
+from coworker.server.app import create_app
+from coworker.server.manager import SessionManager
+
+
+def _service(tmp_path) -> QhOrchestratorStore:
+    return QhOrchestratorStore(tmp_path / "missions.db")
+
+
+def test_mission_plan_requires_confirmation_before_attempt(tmp_path):
+    service = _service(tmp_path)
+    mission = service.create_mission(
+        {
+            "goal": "Implement the Mission workspace",
+            "conversation_id": "conversation-main",
+        }
+    )
+
+    assert mission["mission_id"] == mission["task_id"]
+    assert mission["state"] == TaskStatus.AWAITING_CONFIRMATION.value
+    assert mission["plan"]["status"] == "proposed"
+    assert mission["attempts"] == []
+    assert {member["role"] for member in mission["members"]} >= {
+        "main",
+        "executor",
+        "reviewer",
+    }
+    assert all(member["seat_id"] == member["id"] for member in mission["members"])
+    assert all(
+        member["dependencies"] == member["depends_on"]
+        for member in mission["members"]
+    )
+
+    with pytest.raises(OrchestrationStoreError, match="before plan confirmation"):
+        service.start_attempt(
+            mission["mission_id"],
+            profile_id="opencode-executor",
+            role="executor",
+        )
+
+    updated = service.update_mission_plan(
+        mission["mission_id"],
+        {
+            "goal": "Implement and document the Mission workspace",
+            "idempotency_key": "plan-edit-1",
+        },
+    )
+    assert updated["plan"]["version"] == 2
+    assert updated["plan"]["goal"] == "Implement and document the Mission workspace"
+    duplicate_update = service.update_mission_plan(
+        mission["mission_id"],
+        {"goal": "ignored retry", "idempotency_key": "plan-edit-1"},
+    )
+    assert duplicate_update["plan"]["version"] == 2
+
+    confirmed = service.confirm_mission(
+        mission["mission_id"], idempotency_key="confirm-1"
+    )
+    assert confirmed["state"] == TaskStatus.QUEUED.value
+    assert confirmed["plan"]["status"] == "confirmed"
+    assert confirmed["newly_confirmed"] is True
+    assert service.confirm_mission(mission["mission_id"])["newly_confirmed"] is False
+    service.close()
+
+
+def test_mission_create_and_messages_are_idempotent_and_targeted(tmp_path):
+    service = _service(tmp_path)
+    first = service.create_mission(
+        {
+            "goal": "Route follow-up messages",
+            "conversation_id": "main-session",
+            "idempotency_key": "create-route-mission",
+        }
+    )
+    duplicate = service.create_mission(
+        {
+            "goal": "This retry must not create a second task",
+            "conversation_id": "main-session",
+            "idempotency_key": "create-route-mission",
+        }
+    )
+    assert duplicate["mission_id"] == first["mission_id"]
+    assert len(service.list_missions()) == 1
+
+    mission_id = first["mission_id"]
+    main_message = service.message_mission(
+        mission_id,
+        "Please revise the team plan",
+        target={"kind": "main"},
+        idempotency_key="main-followup-1",
+    )
+    main_retry = service.message_mission(
+        mission_id,
+        "Please revise the team plan",
+        target={"kind": "main"},
+        idempotency_key="main-followup-1",
+    )
+    assert main_message["newly_enqueued"] is True
+    assert main_retry["newly_enqueued"] is False
+    assert main_message["target"] == {"kind": "main"}
+    assert len(service.pending_deliveries("main-session")) == 1
+    with pytest.raises(OrchestrationStoreError, match="different message"):
+        service.message_mission(
+            mission_id,
+            "A conflicting retry",
+            target={"kind": "main"},
+            idempotency_key="main-followup-1",
+        )
+
+    service.confirm_mission(mission_id)
+    attempt = service.start_attempt(
+        mission_id,
+        profile_id="opencode-executor",
+        role="executor",
+        agent_session_id="executor-session",
+    )
+    child_message = service.message_mission(
+        mission_id,
+        "Use the existing helper",
+        target={"kind": "attempt", "attempt_id": attempt["attempt_id"]},
+        idempotency_key="executor-followup-1",
+    )
+    assert child_message["target"] == {
+        "kind": "attempt",
+        "attempt_id": attempt["attempt_id"],
+    }
+    assert service.pending_messages(mission_id)[0]["target"] == child_message["target"]
+    with pytest.raises(OrchestrationStoreError, match="different message"):
+        service.message_mission(
+            mission_id,
+            "Conflicting child retry",
+            target={"kind": "attempt", "attempt_id": attempt["attempt_id"]},
+            idempotency_key="executor-followup-1",
+        )
+
+    with pytest.raises(OrchestrationStoreError, match="does not belong"):
+        service.message_mission(
+            mission_id,
+            "wrong child",
+            target={"kind": "attempt", "attempt_id": "attempt-missing"},
+            idempotency_key="wrong-attempt",
+        )
+    service.close()
+
+
+def test_mission_event_cursor_resumes_without_duplicates(tmp_path):
+    service = _service(tmp_path)
+    mission = service.create_mission({"goal": "Stream ledger events"})
+    first_page = service.mission_events(mission["mission_id"])
+    assert first_page["last_cursor"]
+    assert any(event["type"] == "mission.plan_proposed" for event in first_page["events"])
+
+    service.update_mission_plan(mission["mission_id"], {"goal": "Stream new events"})
+    resumed = service.mission_events(
+        mission["mission_id"], after_cursor=first_page["last_cursor"]
+    )
+    assert [event["type"] for event in resumed["events"]] == [
+        "mission.plan_updated"
+    ]
+    assert resumed["last_cursor"] != first_page["last_cursor"]
+    service.close()
+
+
+@pytest.mark.asyncio
+async def test_main_acp_proposes_structured_plan_before_confirmation(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manager = SessionManager(workspace=workspace, data_dir=tmp_path / "data")
+
+    class FakePlanningAdapter:
+        def __init__(self):
+            self.opened = None
+            self.closed = False
+
+        async def open_session(self, profile, *, cwd, checkpoint, mcp_servers):
+            self.opened = {
+                "profile": profile,
+                "cwd": str(cwd),
+                "checkpoint": checkpoint,
+                "mcp_servers": mcp_servers,
+            }
+            return SimpleNamespace(
+                session_id="kimi-main-session",
+                capabilities={"session": {"resume": True}},
+            )
+
+        async def prompt(self, handle, prompt):
+            assert "Return exactly one JSON object" in prompt
+            return SimpleNamespace(
+                text=json.dumps(
+                    {
+                        "goal": "Plan through Kimi",
+                        "members": [
+                            {
+                                "id": "main:opencode-main",
+                                "role": "main",
+                                "profile_id": "opencode-main",
+                                "objective": "Coordinate",
+                            },
+                            {
+                                "id": "executor:opencode-executor",
+                                "role": "executor",
+                                "profile_id": "opencode-executor",
+                                "objective": "Implement",
+                                "depends_on": ["main:opencode-main"],
+                            },
+                            {
+                                "id": "reviewer:opencode-reviewer",
+                                "role": "reviewer",
+                                "profile_id": "opencode-reviewer",
+                                "objective": "Review read-only",
+                                "depends_on": ["executor:opencode-executor"],
+                            },
+                        ],
+                        "max_rework_rounds": 2,
+                    }
+                ),
+            )
+
+        async def close(self, handle):
+            self.closed = True
+
+    workspace_path = workspace.resolve()
+    planning_adapter = FakePlanningAdapter()
+    manager.acp_adapter = planning_adapter  # type: ignore[assignment]
+    mission = await manager.create_mission_with_main_planning(
+        {"goal": "Plan through Kimi", "workspace": str(workspace)}
+    )
+
+    assert mission["state"] == "AWAITING_CONFIRMATION"
+    assert mission["attempts"] == []
+    assert mission["plan_proposal"] == {
+        "source": "main_agent",
+        "agent_session_id": "kimi-main-session",
+        "fallback_reason": None,
+    }
+    proposed = [
+        event for event in mission["timeline"] if event["type"] == "mission.plan_proposed"
+    ]
+    assert proposed[-1]["payload"]["source"] == "main_agent"
+    assert planning_adapter.opened is not None
+    assert planning_adapter.opened["cwd"] == str(workspace_path)
+    assert planning_adapter.opened["mcp_servers"] == ()
+    assert planning_adapter.opened["profile"].permission_policy == "read-only"
+    assert planning_adapter.opened["profile"].workspace_policy == "readonly"
+    assert planning_adapter.closed is True
+    with pytest.raises(OrchestrationStoreError, match="before plan confirmation"):
+        manager.start_agent_attempt(
+            mission["mission_id"],
+            {"profile_id": "opencode-executor", "role": "executor"},
+        )
+    manager.orchestrator.close()
+
+
+def test_mission_rest_websocket_and_profile_delete_contract(tmp_path):
+    manager = SessionManager(data_dir=tmp_path / "data")
+    manager.start_team_worker = lambda: None  # type: ignore[method-assign]
+    app = create_app(manager)
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/v1/missions",
+            json={"goal": "Exercise the desktop Mission API"},
+        )
+        assert created.status_code == 200
+        mission = created.json()
+        mission_id = mission["mission_id"]
+        assert mission["state"] == "AWAITING_CONFIRMATION"
+        assert mission["plan_proposal"]["source"] == "control_plane_fallback"
+        assert (
+            mission["plan_proposal"]["fallback_reason"]
+            == "workspace_required_for_main_agent"
+        )
+
+        listed = client.get("/v1/missions").json()
+        assert [item["mission_id"] for item in listed["missions"]] == [mission_id]
+        filtered = client.get(
+            "/v1/missions?state=AWAITING_CONFIRMATION&state=BLOCKED"
+        ).json()
+        assert [item["mission_id"] for item in filtered["missions"]] == [mission_id]
+
+        events = client.get(f"/v1/missions/{mission_id}/events").json()
+        cursor = events["events"][0]["cursor"]
+        with client.websocket_connect(
+            f"/v1/missions/{mission_id}/events?after={cursor}"
+        ) as socket:
+            frame = socket.receive_json()
+            assert frame["type"] != "mission.events"
+            assert frame.get("cursor") != cursor
+            assert frame.get("event", {}).get("cursor") != cursor
+
+        main_message = client.post(
+            f"/v1/missions/{mission_id}/messages",
+            json={
+                "message": "Refine the plan",
+                "target": {"kind": "main"},
+                "idempotency_key": "api-main-message",
+            },
+        )
+        assert main_message.status_code == 200
+        assert main_message.json()["target"] == {"kind": "main"}
+
+        confirmed = client.post(
+            f"/v1/missions/{mission_id}/confirm",
+            json={"idempotency_key": "api-confirm"},
+        )
+        assert confirmed.status_code == 200
+        assert confirmed.json()["state"] == "QUEUED"
+
+        cancelled = client.post(f"/v1/missions/{mission_id}/cancel")
+        assert cancelled.status_code == 200
+        assert cancelled.json()["mission_id"] == mission_id
+        assert cancelled.json()["state"] == "CANCELLED"
+        assert "timeline" in cancelled.json()
+
+        profile = {
+            "id": "temporary-explorer",
+            "role": "explorer",
+            "transport": "acp_stdio",
+            "command": "opencode",
+            "args": ["acp"],
+            "permission_policy": "read-only",
+        }
+        assert client.post("/v1/agent-profiles", json=profile).status_code == 200
+        deleted = client.delete("/v1/agent-profiles/temporary-explorer")
+        assert deleted.status_code == 200
+        assert deleted.json()["deleted"] is True
+        assert client.delete("/v1/agent-profiles/temporary-explorer").status_code == 404
+
+
+def test_manager_attempt_default_uses_executor_profile(tmp_path):
+    manager = SessionManager(data_dir=tmp_path / "data")
+    task = manager.delegate_agent_task({"task_spec": {"prompt": "execute"}})
+    attempt = manager.start_agent_attempt(task["task_id"], {})
+    assert attempt["agent_profile_id"] == "opencode-executor"
+    assert attempt["role"] == "executor"
+    manager.orchestrator.close()
+
+
+def test_reviewer_profile_cannot_hold_secret_references():
+    with pytest.raises(ValueError, match="cannot reference secrets"):
+        AgentProfile(
+            id="unsafe-reviewer",
+            role="reviewer",
+            transport="acp_stdio",
+            command="opencode",
+            permission_policy="read-only",
+            secret_refs=["provider-token"],
+        ).validate()

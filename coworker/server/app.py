@@ -12,13 +12,14 @@ import json
 import os
 import re
 import secrets
+import shutil
 import uuid
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -157,6 +158,7 @@ from ..attachments import (
 )
 from ..engine import ApprovalOutcome
 from ..inbox import VIS_INBOX, VIS_INLINE, args_preview
+from ..orchestration import OrchestrationStoreError
 from ..permissions import Mode
 from ..providers import AssistantTurn
 from .manager import SessionManager
@@ -175,6 +177,7 @@ def create_app(manager: SessionManager) -> FastAPI:
             import traceback
 
             traceback.print_exc()
+        manager.start_team_worker()
         yield
         await manager.aclose()  # stop gateway + close MCP connections on shutdown
 
@@ -647,6 +650,13 @@ def create_app(manager: SessionManager) -> FastAPI:
         return manager.add_memory(
             body.get("content", ""), body.get("scope", "workspace")
         )
+
+    @app.post("/v1/memory/audio-transcripts")
+    def add_audio_transcript_memory(body: dict) -> dict[str, Any]:
+        result = manager.add_audio_transcript_memory(body or {})
+        if not result.get("ok"):
+            raise HTTPException(status_code=400, detail=result)
+        return result
 
     @app.post("/v1/chat/completions")
     def chat_completions(body: dict) -> dict[str, Any]:
@@ -1394,6 +1404,254 @@ def create_app(manager: SessionManager) -> FastAPI:
             model=b.get("compaction_model"),
         )
 
+    # -- QH ACP / multi-agent control plane ------------------------------------
+    @app.get("/v1/agent-profiles")
+    def agent_profiles_list() -> dict[str, Any]:
+        return manager.list_agent_profiles()
+
+    @app.post("/v1/agent-profiles")
+    def agent_profiles_put(body: dict) -> dict[str, Any]:
+        try:
+            return manager.upsert_agent_profile(body or {})
+        except (KeyError, ValueError, OrchestrationStoreError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/v1/agent-profiles/{profile_id}")
+    def agent_profiles_delete(profile_id: str) -> dict[str, Any]:
+        try:
+            return manager.delete_agent_profile(profile_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=profile_id) from exc
+        except OrchestrationStoreError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/v1/agent-profiles/main")
+    def agent_profiles_main(workspace: Optional[str] = None) -> dict[str, Any]:
+        try:
+            return manager.get_workspace_main_agent(workspace)
+        except (KeyError, ValueError, OrchestrationStoreError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/v1/agent-profiles/main")
+    def agent_profiles_set_main(body: dict) -> dict[str, Any]:
+        b = body or {}
+        try:
+            return manager.set_workspace_main_agent(
+                b.get("workspace"), str(b.get("profile_id") or "")
+            )
+        except (KeyError, ValueError, OrchestrationStoreError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/v1/agent-profiles/detect")
+    def agent_profiles_detect(commands: str = "") -> dict[str, Any]:
+        """Report which agent CLI commands are on PATH (``shutil.which``).
+
+        ``commands`` is a comma-separated list (capped at 20 names); each token is
+        reduced to a bare command name — paths and arguments are stripped — before
+        the lookup, so nothing here ever touches a shell.
+        """
+        results: dict[str, bool] = {}
+        for raw in str(commands or "").split(","):
+            name = _bare_command_name(raw)
+            if not name or name in results:
+                continue
+            if len(results) >= 20:
+                break
+            results[name] = shutil.which(name) is not None
+        return {"results": results}
+
+    @app.post("/v1/agent-profiles/{profile_id}/probe")
+    async def agent_profiles_probe(profile_id: str, body: dict) -> dict[str, Any]:
+        try:
+            return await manager.probe_agent_profile(
+                profile_id, (body or {}).get("workspace")
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=profile_id) from exc
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/v1/agent-permissions")
+    def agent_permissions_list(pending_only: bool = True) -> dict[str, Any]:
+        return manager.list_agent_permissions(pending_only=pending_only)
+
+    @app.post("/v1/agent-permissions/{permission_id}")
+    async def agent_permissions_resolve(
+        permission_id: str, body: dict
+    ) -> dict[str, Any]:
+        try:
+            return await manager.resolve_agent_permission(
+                permission_id, (body or {}).get("option_id")
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=permission_id) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/v1/missions")
+    async def missions_create(body: dict) -> dict[str, Any]:
+        try:
+            return await manager.create_mission_with_main_planning(body or {})
+        except (KeyError, ValueError, OrchestrationStoreError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/v1/missions")
+    def missions_list(
+        state: Optional[list[str]] = Query(default=None),
+        states: Optional[str] = None,
+    ) -> dict[str, Any]:
+        parsed_states = [item.strip() for item in (state or []) if item.strip()]
+        if states:
+            parsed_states.extend(
+                item.strip() for item in states.split(",") if item.strip()
+            )
+        try:
+            return manager.list_missions(parsed_states or None)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/v1/missions/{mission_id}")
+    def missions_get(mission_id: str) -> dict[str, Any]:
+        try:
+            return manager.get_mission(mission_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=mission_id) from exc
+
+    @app.patch("/v1/missions/{mission_id}/plan")
+    def missions_update_plan(mission_id: str, body: dict) -> dict[str, Any]:
+        try:
+            return manager.update_mission_plan(mission_id, body or {})
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=mission_id) from exc
+        except (ValueError, OrchestrationStoreError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/v1/missions/{mission_id}/confirm")
+    def missions_confirm(mission_id: str, body: Optional[dict] = None) -> dict[str, Any]:
+        try:
+            return manager.confirm_mission(mission_id, body or {})
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=mission_id) from exc
+        except (ValueError, OrchestrationStoreError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/v1/missions/{mission_id}/messages")
+    async def missions_message(mission_id: str, body: dict) -> dict[str, Any]:
+        try:
+            return await manager.message_mission_with_delivery(mission_id, body or {})
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=mission_id) from exc
+        except (ValueError, OrchestrationStoreError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/v1/missions/{mission_id}/cancel")
+    def missions_cancel(mission_id: str) -> dict[str, Any]:
+        try:
+            return manager.cancel_mission(mission_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=mission_id) from exc
+
+    @app.get("/v1/missions/{mission_id}/events")
+    def missions_events(
+        mission_id: str,
+        after: Optional[str] = None,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        try:
+            return manager.mission_events(
+                mission_id,
+                after_cursor=after,
+                limit=limit,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=mission_id) from exc
+
+    @app.post("/v1/team/delegate")
+    def team_delegate(body: dict) -> dict[str, Any]:
+        try:
+            return manager.delegate_agent_task(body or {})
+        except (ValueError, OrchestrationStoreError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/v1/team/{task_id}/status")
+    def team_status(task_id: str) -> dict[str, Any]:
+        try:
+            return manager.agent_task_status(task_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=task_id) from exc
+
+    @app.get("/v1/team/{task_id}/result")
+    def team_result(task_id: str) -> dict[str, Any]:
+        try:
+            return manager.agent_task_result(task_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=task_id) from exc
+
+    @app.post("/v1/team/{task_id}/message")
+    def team_message(task_id: str, body: dict) -> dict[str, Any]:
+        try:
+            return manager.message_agent_task(
+                task_id,
+                str((body or {}).get("message") or ""),
+                idempotency_key=(body or {}).get("idempotency_key"),
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=task_id) from exc
+        except (ValueError, OrchestrationStoreError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/v1/team/{task_id}/cancel")
+    def team_cancel(task_id: str) -> dict[str, Any]:
+        try:
+            return manager.cancel_agent_task(task_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=task_id) from exc
+
+    @app.post("/v1/team/{task_id}/attempts")
+    def team_start_attempt(task_id: str, body: dict) -> dict[str, Any]:
+        try:
+            return manager.start_agent_attempt(task_id, body or {})
+        except (KeyError, ValueError, OrchestrationStoreError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/v1/team/{task_id}/artifacts")
+    def team_add_artifact(task_id: str, body: dict) -> dict[str, Any]:
+        try:
+            return manager.add_agent_artifact(task_id, body or {})
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=task_id) from exc
+        except (ValueError, OrchestrationStoreError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/v1/review/request")
+    def review_request(body: dict) -> dict[str, Any]:
+        b = body or {}
+        try:
+            return manager.request_agent_review(str(b.get("artifact_id") or ""), b)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (ValueError, OrchestrationStoreError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/v1/team/{task_id}/reviews")
+    def review_record(task_id: str, body: dict) -> dict[str, Any]:
+        try:
+            return manager.record_agent_review(task_id, body or {})
+        except (KeyError, ValueError, OrchestrationStoreError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/v1/team/deliveries")
+    def team_delivery_enqueue(body: dict) -> dict[str, Any]:
+        return manager.enqueue_agent_delivery(body or {})
+
+    @app.get("/v1/team/deliveries/{target_session_id}")
+    def team_deliveries_pending(target_session_id: str) -> dict[str, Any]:
+        return manager.pending_agent_deliveries(target_session_id)
+
+    @app.post("/v1/team/deliveries/{delivery_id}/delivered")
+    def team_delivery_mark(delivery_id: str) -> dict[str, Any]:
+        return manager.mark_agent_delivery_delivered(delivery_id)
+
     @app.post("/v1/attachments/inspect-pdf")
     def attachments_inspect_pdf(body: dict) -> dict[str, Any]:
         # Attach-time page/size probe for the composer's threshold check. Local only.
@@ -1485,6 +1743,9 @@ def create_app(manager: SessionManager) -> FastAPI:
             return
         await ws.accept(subprotocol="openworker" if api_token else None)
         agent = ws.query_params.get("agent") or "code"
+        if ws.query_params.get("runtime") == "acp":
+            await _ws_main_acp(ws, session_id, agent)
+            return
 
         # All four interactive prompts (approval / question / directory / plan) are parked as Inbox
         # items and awaited via inbox.wait — so they survive a dropped socket (redelivered on
@@ -1929,6 +2190,204 @@ def create_app(manager: SessionManager) -> FastAPI:
         finally:
             manager.unregister_session_client(session_id, ws.send_json)
 
+    async def _ws_main_acp(ws: WebSocket, session_id: str, agent: str) -> None:
+        workspace = manager.resolve_workspace(ws.query_params.get("workspace"))
+        if not workspace:
+            await ws.send_json(
+                {
+                    "type": "error",
+                    "data": {
+                        "error": "no valid workspace — choose a project folder first"
+                    },
+                }
+            )
+            await ws.close()
+            return
+
+        try:
+            profile_id = (ws.query_params.get("profile_id") or "").strip() or None
+            handle = await manager.main_acp_host.open(
+                session_id, workspace, profile_id=profile_id
+            )
+        except Exception as exc:
+            await ws.send_json({"type": "error", "data": {"error": str(exc)}})
+            await ws.close()
+            return
+
+        await ws.send_json(
+            {
+                "type": "ready",
+                "data": {
+                    "session_id": session_id,
+                    "agent": agent,
+                    "runtime": "acp",
+                    "agent_session_id": handle.session_id,
+                    "model": handle.profile_id,
+                    "workspace": workspace,
+                    "command_trust": manager.workspace_command_trust(workspace),
+                },
+            }
+        )
+        manager.register_session_client(session_id, ws.send_json)
+        inbound_times: deque[float] = deque()
+        running: asyncio.Task[None] | None = None
+
+        async def reject_input(reason: str) -> None:
+            await ws.send_json({"type": "input_rejected", "data": {"error": reason}})
+
+        async def run_turn(text: str) -> None:
+            try:
+                await manager.broadcast_session(
+                    session_id, {"type": "turn_start", "data": {"input": text}}
+                )
+                result = await manager.main_acp_host.prompt(
+                    session_id, text, workspace=workspace
+                )
+                await manager.broadcast_session(
+                    session_id,
+                    {
+                        "type": "assistant_message",
+                        "data": {
+                            "text": result.text,
+                            "stop_reason": result.stop_reason,
+                            "agent_session_id": result.agent_session_id,
+                            "profile_id": result.profile_id,
+                        },
+                    },
+                )
+            except Exception as exc:
+                await manager.broadcast_session(
+                    session_id, {"type": "error", "data": {"error": str(exc)}}
+                )
+            finally:
+                await manager.broadcast_session(
+                    session_id, {"type": "turn_done", "data": {}}
+                )
+
+        try:
+            while True:
+                try:
+                    message = await ws.receive_json()
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    await reject_input("Invalid WebSocket message: expected JSON.")
+                    continue
+
+                now = asyncio.get_running_loop().time()
+                while (
+                    inbound_times
+                    and now - inbound_times[0] > _WS_RATE_LIMIT_WINDOW_SECONDS
+                ):
+                    inbound_times.popleft()
+                if len(inbound_times) >= _WS_RATE_LIMIT_COUNT:
+                    await reject_input("Too many WebSocket messages; reconnect and try again.")
+                    await ws.close(code=1008)
+                    return
+                inbound_times.append(now)
+
+                if not isinstance(message, dict):
+                    await reject_input("Invalid WebSocket message: expected an object.")
+                    continue
+                kind = message.get("type")
+                if not isinstance(kind, str):
+                    await reject_input("Invalid WebSocket message: missing string type.")
+                    continue
+                if kind == "interrupt":
+                    await manager.main_acp_host.cancel(session_id)
+                elif kind == "user_message":
+                    raw_text = message.get("text")
+                    if raw_text is None:
+                        raw_text = ""
+                    if not isinstance(raw_text, str):
+                        await reject_input("Invalid message text: expected a string.")
+                        continue
+                    text = raw_text.strip()
+                    if len(text) > _MAX_MESSAGE_TEXT_CHARS:
+                        await reject_input(
+                            f"Message too long ({len(text)} chars; limit {_MAX_MESSAGE_TEXT_CHARS})."
+                        )
+                        continue
+                    if not text:
+                        continue
+                    if running is not None and not running.done():
+                        await reject_input(
+                            "This session is already running a turn. Wait for it to finish or stop it."
+                        )
+                        continue
+                    running = asyncio.create_task(run_turn(text))
+                else:
+                    await reject_input(f"Unknown WebSocket message type: {kind}.")
+        except WebSocketDisconnect:
+            pass
+        finally:
+            manager.unregister_session_client(session_id, ws.send_json)
+
+    @app.websocket("/v1/missions/{mission_id}/events")
+    async def ws_mission_events(ws: WebSocket, mission_id: str) -> None:
+        """Cursor-resumable Mission ledger stream.
+
+        The ledger remains the source of truth; this socket only polls new rows and
+        exposes the same event envelope as the REST fallback endpoint.
+        """
+
+        if not _websocket_authenticated(ws):
+            await ws.close(code=1008)
+            return
+        if not _origin_allowed(ws.headers.get("origin")):
+            await ws.close(code=1008)
+            return
+        try:
+            manager.get_mission(mission_id)
+        except KeyError:
+            await ws.close(code=4404)
+            return
+        await ws.accept(subprotocol="openworker" if api_token else None)
+        cursor = ws.query_params.get("after") or None
+        first = True
+        try:
+            while True:
+                page = manager.mission_events(
+                    mission_id,
+                    after_cursor=cursor,
+                    limit=200,
+                )
+                events = page.get("events") or []
+                if events:
+                    for event in events:
+                        await ws.send_json(
+                            {
+                                "type": event["event_type"],
+                                "event": event,
+                                "cursor": event["cursor"],
+                            }
+                        )
+                    first = False
+                elif first:
+                    await ws.send_json(
+                        {
+                            "type": "mission.snapshot",
+                            "cursor": page.get("last_cursor"),
+                            "event_id": page.get("last_cursor"),
+                            "payload": {"mission": manager.get_mission(mission_id)},
+                        }
+                    )
+                    first = False
+                cursor = page.get("last_cursor") or cursor
+                try:
+                    inbound = await asyncio.wait_for(ws.receive_json(), timeout=0.35)
+                    if isinstance(inbound, dict) and inbound.get("type") == "ping":
+                        await ws.send_json(
+                            {
+                                "type": "pong",
+                                "data": {"last_cursor": cursor},
+                            }
+                        )
+                except asyncio.TimeoutError:
+                    continue
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+        except WebSocketDisconnect:
+            return
+
     @app.websocket("/ws/events")
     async def ws_events(ws: WebSocket) -> None:
         """App-wide event stream (session-independent): the GUI keeps one open for
@@ -1951,6 +2410,19 @@ def create_app(manager: SessionManager) -> FastAPI:
             manager.unregister_event_client(ws.send_json)
 
     return app
+
+
+_COMMAND_NAME_RE = re.compile(r"^[A-Za-z0-9._+-]+$")
+
+
+def _bare_command_name(raw: str) -> str:
+    """Reduce one comma-separated token to a bare command name (strip paths/args)."""
+    token = str(raw or "").strip()
+    if not token:
+        return ""
+    token = token.split()[0]  # drop any arguments
+    token = token.replace("\\", "/").rsplit("/", 1)[-1]  # drop any path prefix
+    return token if _COMMAND_NAME_RE.match(token) else ""
 
 
 def _parse_json(s: str) -> dict[str, Any]:

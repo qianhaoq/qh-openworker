@@ -99,16 +99,22 @@ def _validate_telegram(creds: dict) -> ValidationResult:
 
     token = creds.get("bot_token", "")
     try:
-        data = httpx.get(
+        resp = httpx.get(
             f"https://api.telegram.org/bot{token}/getMe", timeout=15
-        ).json()
+        )
+        data = resp.json()
     except Exception as exc:
         return ValidationResult(False, error=str(exc))
     if data.get("ok"):
         return ValidationResult(
             True, identity="@" + str(data["result"].get("username", "bot"))
         )
-    return ValidationResult(False, error=data.get("description") or "invalid bot token")
+    description = data.get("description") or "invalid bot token"
+    # Telegram answers a bad token with 404 {"description": "Not Found"} — meaningless
+    # to a user ("Not Found" what?), so translate it; keep every other API message.
+    if resp.status_code == 404 or description == "Not Found":
+        return ValidationResult(False, error="Invalid bot token.")
+    return ValidationResult(False, error=description)
 
 
 def _validate_email(creds: dict) -> ValidationResult:

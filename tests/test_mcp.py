@@ -254,3 +254,32 @@ def test_rest_crud(tmp_path, monkeypatch):
     assert client.delete("/v1/mcp/fs").json()["ok"] is True
     assert client.get("/v1/mcp").json()["servers"] == []
     assert client.delete("/v1/mcp/fs").json()["ok"] is False
+
+
+# -- tools listing: spawn failures must be actionable ---------------------------
+@pytest.mark.asyncio
+async def test_mcp_tools_missing_command_names_the_command(tmp_path, monkeypatch):
+    """Live-audit #7: a stdio server whose binary doesn't exist must say WHICH command
+    failed — not leak a raw '[Errno 2] No such file or directory'."""
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+    manager = SessionManager(data_dir=tmp_path / "data")
+    assert manager.add_mcp("bogus", {"command": "definitely-not-a-real-cmd-xyz"})["ok"]
+
+    res = await manager.mcp_tools("bogus")
+    assert res["ok"] is False and res["tools"] == []
+    assert res["error"] == "MCP server command not found: definitely-not-a-real-cmd-xyz"
+
+
+@pytest.mark.asyncio
+async def test_mcp_tools_permission_error_is_actionable(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+    manager = SessionManager(data_dir=tmp_path / "data")
+    assert manager.add_mcp("noperm", {"command": "/usr/bin/noperm"})["ok"]
+
+    async def _deny(server, *, interactive: bool = False):
+        raise PermissionError(13, "Permission denied", server.command)
+
+    monkeypatch.setattr(manager.mcp, "ensure", _deny)
+    res = await manager.mcp_tools("noperm")
+    assert res["ok"] is False and res["tools"] == []
+    assert res["error"] == "MCP server command not executable: /usr/bin/noperm"

@@ -1,13 +1,13 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-  Build the Coworker Windows desktop app + NSIS (.exe) and MSI installers.
+  Build the QH 助理 Windows desktop app + NSIS (.exe) and MSI installers.
 
 .DESCRIPTION
   The Windows counterpart to build_dmg.sh:
     1. PyInstaller-bundle the server into a standalone onedir folder (no venv at runtime).
     2. Stage it at binaries\sidecar\ for Tauri's `resources` slot.
-    3. `tauri build --bundles nsis,msi` -> Coworker NSIS setup .exe + .msi (resources copied in).
+    3. `tauri build --bundles nsis,msi` -> QH 助理 NSIS setup .exe + .msi (resources copied in).
 
   Prerequisites (see the toolchain notes in the PR/plan):
     - Rust (rustup) with the x86_64-pc-windows-msvc target + the MSVC C++ build tools (link.exe).
@@ -82,20 +82,10 @@ Copy-Item -Recurse -Force $Src $Dst
 Write-Host "    -> $Dst"
 
 Write-Host "==> [3/3] tauri build (--bundles $Bundles)" -ForegroundColor Cyan
-# Auto-update artifacts (NSIS setup .exe + minisign .sig): produced only when the updater
-# signing key env is present (CI secret TAURI_SIGNING_PRIVATE_KEY). Keyless builds skip
-# the overlay so dev builds keep working; keyless RELEASES strand installs without
-# auto-update.
+# Updater artifacts are disabled for qh-openworker until qh owns an updater endpoint and
+# Tauri updater signing key. This script must not generate .sig/latest.json inputs.
 $UpdaterArgs = @()
-if ($env:TAURI_SIGNING_PRIVATE_KEY) {
-    # Pass the overlay as a FILE: inline JSON loses its quotes through the
-    # PowerShell -> npm.cmd -> cmd hop ("key must be a string", v0.1.3 run).
-    $Overlay = Join-Path ([IO.Path]::GetTempPath()) "ocw-updater-overlay.json"
-    Set-Content -Path $Overlay -Value '{"bundle":{"createUpdaterArtifacts":true}}' -Encoding ascii
-    $UpdaterArgs = @("--config", $Overlay)
-} else {
-    Write-Host "    WARNING: no updater signing key - building WITHOUT auto-update artifacts (not releasable)." -ForegroundColor Yellow
-}
+Write-Host "    updater artifacts disabled for qh-openworker (no .sig/latest.json generation)." -ForegroundColor Yellow
 Push-Location $Gui
 try {
     & npm run tauri build -- --bundles $Bundles @UpdaterArgs

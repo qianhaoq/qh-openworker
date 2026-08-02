@@ -1605,6 +1605,40 @@ def test_validate_whoami_helper(monkeypatch):
     assert not res.ok
 
 
+def test_validate_telegram_maps_bad_token_404(monkeypatch):
+    """Live-audit #5: Telegram answers a bad bot token with 404 {"description":
+    "Not Found"} — showing "Not Found" verbatim is meaningless; map it to a clear
+    message. Every other API description passes through unchanged."""
+    import httpx
+
+    import coworker.connectors.descriptors as d
+
+    class _Resp:
+        def __init__(self, status, payload):
+            self.status_code = status
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    def fake(status, payload):
+        monkeypatch.setattr(httpx, "get", lambda *a, **k: _Resp(status, payload))
+
+    fake(404, {"ok": False, "description": "Not Found"})
+    res = d._validate_telegram({"bot_token": "AUDIT-BOGUS-TOKEN-123"})
+    assert not res.ok and res.error == "Invalid bot token."
+
+    # any other Telegram error description is kept as-is
+    fake(401, {"ok": False, "description": "Unauthorized"})
+    res = d._validate_telegram({"bot_token": "x"})
+    assert not res.ok and res.error == "Unauthorized"
+
+    # a good token still resolves the bot identity
+    fake(200, {"ok": True, "result": {"username": "mybot"}})
+    res = d._validate_telegram({"bot_token": "good"})
+    assert res.ok and res.identity == "@mybot"
+
+
 # -- experimental connector gating ----------------------------------------------
 @pytest.fixture
 def experimental_descriptor():

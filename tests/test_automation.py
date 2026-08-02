@@ -335,6 +335,107 @@ async def test_manual_run_prepare_and_finalize(tmp_path, monkeypatch):
     assert manager.task_store.get(task.id).run_count == 1
 
 
+async def test_manual_run_finalize_marks_failed_turn_error(tmp_path, monkeypatch):
+    """Live-audit #4: the GUI finalizes on ANY turn_done (errored turns included), so a
+    manual run whose first turn died (e.g. no provider key) must be recorded as
+    "error" — not 完成/ok. A clean turn still finalizes as "ok"."""
+    from coworker.providers import AssistantTurn, ModelCapabilities, ProviderClient
+    from coworker.server.manager import SessionManager
+
+    class FailingProvider(ProviderClient):
+        def complete(self, *, model, messages, tools=None, **settings):
+            raise RuntimeError("No model API key configured.")
+
+        def capabilities(self, model):
+            return ModelCapabilities()
+
+    class OkProvider(ProviderClient):
+        def complete(self, *, model, messages, tools=None, **settings):
+            return AssistantTurn(text="all good", finish_reason="stop")
+
+        def capabilities(self, model):
+            return ModelCapabilities()
+
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+
+    async def run_once(provider):
+        ws = tmp_path / f"ws-{id(provider)}"
+        ws.mkdir()
+        manager = SessionManager(data_dir=tmp_path / f"data-{id(provider)}", provider=provider)
+        task = _task(workspace=str(ws), agent="cowork")
+        manager.task_store.save(task)
+        prep = manager.prepare_manual_run(task.id)
+        engine = manager.get_engine(prep["session_id"], workspace=str(ws), agent="cowork")
+        async for _ in engine.run(prep["prompt"]):
+            pass
+        manager.save(prep["session_id"], engine)
+        out = manager.finalize_manual_run(task.id, prep["run_id"])
+        return manager, task, out
+
+    # errored turn → error run + error last_status, with the turn's reason attached
+    manager, task, out = await run_once(FailingProvider())
+    assert out["ok"] and out["run"]["status"] == "error"
+    assert "No model API key configured" in (out["run"]["error"] or "")
+    saved = manager.task_store.get(task.id)
+    assert saved.last_status == "error" and saved.run_count == 1
+
+    # clean turn → still ok (and no error text)
+    manager, task, out = await run_once(OkProvider())
+    assert out["ok"] and out["run"]["status"] == "ok"
+    assert out["run"]["error"] is None
+    assert manager.task_store.get(task.id).last_status == "ok"
+
+
+async def test_scheduled_run_marks_failed_turn_error(tmp_path, monkeypatch):
+    """Same defect as manual-run finalize: a scheduled run whose turn died at the
+    provider (an error EVENT, not an exception) used to record "ok". The transcript
+    tail now decides; the Scheduler propagates run.status to task.last_status."""
+    from coworker.providers import AssistantTurn, ModelCapabilities, ProviderClient
+    from coworker.server.manager import SessionManager
+
+    class FailingProvider(ProviderClient):
+        def complete(self, *, model, messages, tools=None, **settings):
+            raise RuntimeError("No model API key configured.")
+
+        def capabilities(self, model):
+            return ModelCapabilities()
+
+    class OkProvider(ProviderClient):
+        def complete(self, *, model, messages, tools=None, **settings):
+            return AssistantTurn(text="brief ready", finish_reason="stop")
+
+        def capabilities(self, model):
+            return ModelCapabilities()
+
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+
+    async def run_once(provider, tag):
+        ws = tmp_path / f"ws-{tag}"
+        ws.mkdir()
+        manager = SessionManager(data_dir=tmp_path / f"data-{tag}", provider=provider)
+        task = _task(workspace=str(ws), agent="cowork")
+        manager.task_store.save(task)
+        # Drive through the Scheduler so last_status propagation is covered too.
+        sched = Scheduler(
+            manager.task_store,
+            lambda t, trigger: manager._run_scheduled_task(t, trigger=trigger),
+        )
+        run = await sched.run_task(task, trigger="schedule")
+        return manager, task, run
+
+    # errored turn → error run, with the turn's reason, and error last_status
+    manager, task, run = await run_once(FailingProvider(), "fail")
+    assert run.status == "error"
+    assert "No model API key configured" in (run.error or "")
+    assert manager.task_store.get(task.id).last_status == "error"
+
+    # clean turn → ok, no error text, result captured
+    manager, task, run = await run_once(OkProvider(), "ok")
+    assert run.status == "ok" and run.error is None
+    assert run.result_text == "brief ready"
+    assert manager.task_store.get(task.id).last_status == "ok"
+
+
 # -- REST ----------------------------------------------------------------------
 def test_automations_rest(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient

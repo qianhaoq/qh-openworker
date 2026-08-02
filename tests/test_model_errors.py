@@ -84,3 +84,33 @@ def test_unrelated_errors_pass_through_raw():
         friendly_model_error("gpt-5.6-sol", RuntimeError("connection reset by peer"))
         is None
     )
+
+
+# -- missing-key message points at the real UI ----------------------------------
+def test_missing_key_message_points_to_settings(monkeypatch, tmp_path):
+    """Live-audit #13: the no-key error referenced 'Manage → Settings' / 'Manage →
+    Configure Models' — there is no 'Manage' in the current UI. Every provider's
+    message must end with 'add your key in Settings.' (stable 'No ... API key
+    configured' prefix — the frontend pattern-matches it)."""
+    import pytest
+
+    from coworker.providers.anthropic_provider import AnthropicProvider
+    from coworker.providers.gemini_provider import GeminiProvider
+    from coworker.providers.openai_provider import OpenAIProvider
+    from coworker.secrets import SecretStore
+
+    for env in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        monkeypatch.delenv(env, raising=False)
+    secrets = SecretStore(path=tmp_path / "secrets.json")
+
+    for cls, prefix in (
+        (OpenAIProvider, "No model API key configured"),
+        (AnthropicProvider, "No Anthropic API key configured"),
+        (GeminiProvider, "No Gemini API key configured"),
+    ):
+        with pytest.raises(RuntimeError) as excinfo:
+            cls(secrets=secrets)._ensure_client()
+        msg = str(excinfo.value)
+        assert msg.startswith(prefix)
+        assert msg.endswith("add your key in Settings.")
+        assert "Manage" not in msg

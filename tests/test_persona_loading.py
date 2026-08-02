@@ -82,6 +82,31 @@ def test_install_from_git_uses_injected_clone(tmp_path):
     assert "acme-ops" in reg.ids()
 
 
+def test_install_from_git_clone_failure_is_clean(tmp_path):
+    """Live-audit #11: a failed clone surfaced CalledProcessError's str() — the full
+    command line incl. the machine's persona-cache path. The user gets a clean,
+    actionable message with no internal paths instead."""
+    import subprocess
+
+    reg = PersonaRegistry(state_path=tmp_path / "personas.json")
+
+    def failing_clone(url, dest):
+        raise subprocess.CalledProcessError(
+            128, ["git", "clone", "--depth", "1", url, str(dest)]
+        )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        reg.install_from_git(
+            "https://example.com/audit-nope.git",
+            cache_base=tmp_path / "cache",
+            clone=failing_clone,
+        )
+    msg = str(excinfo.value)
+    assert msg == "Failed to clone repository. Check the URL and network access."
+    assert str(tmp_path) not in msg  # no internal cache paths leak
+    assert "exit status" not in msg  # no raw CalledProcessError text
+
+
 def test_invalid_third_party_manifest_fails_loud(tmp_path):
     bad = "---\nid: broken\ntools: [does_not_exist]\n---\nbody\n"
     reg = PersonaRegistry(state_path=tmp_path / "personas.json")

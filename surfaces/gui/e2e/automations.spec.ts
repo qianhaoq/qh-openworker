@@ -1,33 +1,49 @@
-import { test, expect } from "./fixtures";
+import { expect } from "@playwright/test";
+import { test } from "./fixtures";
 
-// Automation runs open as live sessions — which used to look like any other chat with no way
-// back (owner report, 2026-07-04). Guards: the run-session banner (task title + automation
-// context) and "← Back to runs" returning to the task's detail page.
-test("scheduled run session shows the run banner; Back returns to the task detail", async ({
-  page,
-}) => {
-  await page.goto("/");
-  await page.getByTestId("account-row").click();
-  await page.getByTestId("account-menu").getByRole("button", { name: "Automations", exact: true }).click();
+// The Automations page: the scheduled-task list with enable toggles, expandable run
+// history, and 立即运行 — which prepares a run server-side and opens its live session in
+// the assistant. Fixtures seed task-1 (running run + unseen badges) and task-2 (quiet).
 
-  // Task list → detail (runs list).
-  await page.getByText("Daily AI News").first().click();
-  await expect(page.getByRole("button", { name: /Run now/ })).toBeVisible();
-  await expect(page.getByText("Each run is a live conversation", { exact: false })).toBeVisible();
+test("the automation list renders with schedules and status", async ({ page }) => {
+  await page.goto("/#/automations");
+  await expect(page.getByRole("heading", { name: "自动化" })).toBeVisible();
+  await expect(page.getByText("全部自动化（2）")).toBeVisible();
+  await expect(page.getByText("Daily AI News", { exact: true })).toBeVisible();
+  await expect(page.getByText("Weekly CRM digest", { exact: true })).toBeVisible();
+  // task-1 carries the unseen-runs pill (2 new, newest failed).
+  await expect(page.getByText("2 条新记录", { exact: true })).toBeVisible();
+});
 
-  // Open the running run: a normal session view, but with the automation-context banner.
-  await page.getByTitle("Open this run's conversation").click();
-  const banner = page.getByTestId("run-banner");
-  await expect(banner).toBeVisible();
-  await expect(banner).toContainText("Scheduled run");
-  await expect(banner).toContainText("Daily AI News");
+test("toggling an automation off marks it paused", async ({ page }) => {
+  await page.goto("/#/automations");
+  const row = page.locator("div[role='button']", { hasText: "Weekly CRM digest" });
+  const toggle = row.getByRole("switch");
+  await expect(toggle).toBeChecked();
+  // Controlled switch: click, then the PATCH + refetch flips it.
+  await toggle.click();
+  await expect(toggle).not.toBeChecked();
+  await expect(row).toContainText("已暂停");
+});
 
-  // Back link lands on the SAME task's detail, not the bare list.
-  await banner.getByRole("button", { name: "← Back to runs" }).click();
-  await expect(page.getByRole("button", { name: /Run now/ })).toBeVisible();
-  await expect(page.getByText("Daily AI News").first()).toBeVisible();
+test("expanding 运行记录 shows the run history and clears the unseen pill", async ({ page }) => {
+  await page.goto("/#/automations");
+  // task-1 is the first row; its 运行记录 toggle is a sibling of the row button.
+  await page.getByRole("button", { name: /运行记录/ }).first().click();
 
-  // A plain (non-run) session never shows the banner.
-  await page.getByText("Draft the launch note").first().click();
-  await expect(page.getByTestId("run-banner")).toHaveCount(0);
+  // The running seeded run renders its live status.
+  const runs = page.locator("main").getByText("进行中…", { exact: true });
+  await expect(runs).toBeVisible();
+  // Expanding marks the runs seen — the pill clears on the refetch.
+  await expect(page.getByText("条新记录", { exact: false })).toBeHidden();
+});
+
+test("立即运行 prepares a run and opens its live session", async ({ page }) => {
+  await page.goto("/#/automations");
+  // exact: the row's own accessible name embeds the button's aria-label.
+  await page.getByRole("button", { name: "立即运行 Weekly CRM digest", exact: true }).click();
+
+  await expect(page).toHaveURL(/#\/assistant\/__run__r2$/);
+  // The run session is a fresh conversation view (its prompt streams on the driver socket).
+  await expect(page.getByText("新会话", { exact: true }).first()).toBeVisible();
 });

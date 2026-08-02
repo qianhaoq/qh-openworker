@@ -1,26 +1,16 @@
-# OpenWorker
+# QH OpenWorker
 
-**[openworker.com](https://openworker.com)** · [Download](#download) · [Issues](https://github.com/andrewyng/openworker/issues)
+**[Repository](https://github.com/qianhaoq/qh-openworker)** · [ACP-first design](docs/acp-first-personal-agent.md) · [Fork identity](docs/fork-identity.md)
 
-<a href="https://trendshift.io/repositories/91434?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-91434" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/91434/daily?language=Python" alt="andrewyng%2Fopenworker | Trendshift" width="250" height="55"/></a>
+> QH OpenWorker is a personal fork of [OpenWorker](https://github.com/andrewyng/openworker). It adds a configurable ACP main Agent, durable multi-Agent coding orchestration, scoped knowledge/audio transcript memory, and an isolated review/rework loop.
 
-> **Beta** - OpenWorker is in open beta: fully usable, updates itself, and we're actively polishing rough edges. [Issues](https://github.com/andrewyng/openworker/issues) welcome.
+The fork updater is intentionally disabled until qh-owned download infrastructure and signing keys are configured. Build and run it from source; it will not consume upstream update manifests.
 
-**AI that gets your everyday tasks done.** OpenWorker is an open-source AI coworker that lives on your desktop and delivers **finished work**, not just chat: a polished document, a Slack reply with the numbers, an updated calendar, a triaged inbox.
+**AI that gets your everyday tasks done.** QH OpenWorker is a local-first AI coworker that lives on your desktop and delivers **finished work**, not just chat: a code change, a review report, a polished document, a Slack reply with the numbers, or a triaged inbox.
 
 It runs on your machine and doesn't lock you into any model: bring your own API key for OpenAI, Anthropic, Google, or an open-weight provider, or run fully local with Ollama. Your data leaves your machine only through the model and integrations *you* choose.
 
-[![How OpenWorker works](docs/assets/how-it-works.png)](https://openworker.com)
-
-## Download
-
-[**⬇ macOS (Apple Silicon)**](https://download.openworker.com/mac)
-<sub>macOS 12+ · signed & notarized · auto-updates</sub>
-
-[**⬇ Windows 10/11 (x64)**](https://download.openworker.com/windows)
-<sub>builds are not yet code-signed, so SmartScreen will warn; signing is in progress</sub>
-
-Open the app, add a model key (or point it at Ollama), and ask for something real.
+![How QH OpenWorker works](docs/assets/how-it-works.png)
 
 ## How it works
 
@@ -33,7 +23,7 @@ Under the hood:
 
 ```text
 ┌────────────────────────────────────────────────┐
-│              OpenWorker desktop app            │  native shell + GUI
+│            QH OpenWorker desktop app            │  native shell + GUI
 ├────────────────────────────────────────────────┤
 │           local agent server (Python)          │  engine · tools · connectors - built on aisuite
 ├───────────────┬────────────────┬───────────────┤
@@ -60,15 +50,15 @@ A curated model list marks what we've verified for tool-calling work. Adding any
 
 ## Privacy
 
-OpenWorker is local-first. Everything lives on your machine: the agent loop, your conversations, connector tokens, and model keys - all in the app's local secret store. The only cloud piece is a small service that brokers OAuth handshakes for connectors. You can always use the App without signing-in - use the connectors via manually-created credentials/API-keys.
+QH OpenWorker is local-first. Everything lives on your machine: the agent loop, your conversations, connector tokens, and model keys - all in the app's local secret store. The optional OpenWorker Cloud integration brokers OAuth handshakes for connectors. You can use the app without signing in and configure connectors with manually-created credentials/API keys.
 
 ## Run from source
 
 Prerequisites: Python 3.10+, Node 20+, and (for the desktop shell) the Rust toolchain via [rustup](https://rustup.rs/).
 
 ```shell
-git clone https://github.com/andrewyng/openworker
-cd openworker
+git clone https://github.com/qianhaoq/qh-openworker
+cd qh-openworker
 
 # 1. One-time bootstrap - creates the Python venv at .venv
 #    (on Windows, run from Git Bash or WSL)
@@ -112,7 +102,7 @@ OpenWorker was originally developed inside the aisuite repository before moving 
 
 ## Contributing
 
-Contributions and bug reports are welcome - open an [issue](https://github.com/andrewyng/openworker/issues) or a pull request. The app updates itself, so fixes reach installs quickly.
+Contributions and bug reports are welcome in the [qh-openworker repository](https://github.com/qianhaoq/qh-openworker). This fork does not auto-update; releases remain an explicit qh-owned build and signing operation.
 For any PR, please attach screenshots of what was broken and how it is fixed now. We will shortly add features that you can contribute to.
 Please note that we are actively developing based off a internal list and goal, so we may not approve PRs that add features that are already under-development or deviates from our vision.
 
