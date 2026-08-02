@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from ..secrets import SecretStore
+from ..state_migration import bootstrap_state
 from .base import SessionSource
 
 PLATFORMS = ("telegram", "slack", "github")
@@ -71,7 +72,9 @@ def load_settings(
     Allowlist/allow-all come from the profile or `<PLATFORM>_ALLOWED_USERS` /
     `<PLATFORM>_ALLOW_ALL_USERS` env vars (env wins).
     """
-    secrets = secrets or SecretStore()
+    if secrets is None:
+        bootstrap_state()
+        secrets = SecretStore()
     out: dict[str, ConnectorSettings] = {}
     for platform in PLATFORMS:
         profile = secrets.get(f"{platform}:default") or {}

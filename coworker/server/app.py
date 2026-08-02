@@ -17,7 +17,7 @@ import uuid
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -160,26 +160,100 @@ from ..engine import ApprovalOutcome
 from ..inbox import VIS_INBOX, VIS_INLINE, args_preview
 from ..orchestration import OrchestrationStoreError
 from ..permissions import Mode
-from ..providers import AssistantTurn
+from ..providers import AssistantTurn, provider_descriptors
+from ..state_migration import (
+    StateMigrationError,
+    bootstrap_state,
+    migration_report,
+    migration_status,
+)
 from .manager import SessionManager
 
 
-def create_app(manager: SessionManager) -> FastAPI:
+_MIGRATION_READ_PATHS = {
+    "/v1/health",
+    "/v1/settings",
+    "/v1/providers",
+    "/v1/state-migration",
+    "/v1/state-migration/report",
+}
+
+
+class _StateMigrationBarrierMiddleware:
+    """One HTTP/WebSocket write barrier for diagnostics-only startup."""
+
+    def __init__(self, app: Any, *, diagnostics_only: Callable[[], bool]) -> None:
+        self.app = app
+        self.diagnostics_only = diagnostics_only
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if not self.diagnostics_only():
+            await self.app(scope, receive, send)
+            return
+        if scope["type"] == "http":
+            method = str(scope.get("method") or "GET").upper()
+            path = str(scope.get("path") or "")
+            allowed = (method == "GET" and path in _MIGRATION_READ_PATHS) or (
+                method == "POST" and path == "/v1/state-migration/retry"
+            )
+            if allowed:
+                await self.app(scope, receive, send)
+                return
+            response = JSONResponse(
+                {
+                    "error": {
+                        "code": "STATE_MIGRATION_REQUIRED",
+                        "message": "State migration must complete before writes are enabled.",
+                    }
+                },
+                status_code=503,
+            )
+            await response(scope, receive, send)
+            return
+        if scope["type"] == "websocket":
+            await send({"type": "websocket.accept"})
+            await send(
+                {
+                    "type": "websocket.send",
+                    "text": json.dumps(
+                        {
+                            "type": "error",
+                            "data": {
+                                "code": "STATE_MIGRATION_REQUIRED",
+                                "error": "State migration must complete before sessions can run.",
+                                "status": 503,
+                            },
+                        }
+                    ),
+                }
+            )
+            await send({"type": "websocket.close", "code": 1013})
+            return
+        await self.app(scope, receive, send)
+
+
+def create_app(
+    manager: SessionManager | None,
+    *,
+    manager_factory: Callable[[], SessionManager] | None = None,
+) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        try:
-            live = (
-                await manager.start_gateway()
-            )  # start messaging listeners (if configured)
-            if live:
-                print(f"[coworker] messaging gateway live: {', '.join(live)}")
-        except Exception:  # never let a bad connector stop the server
-            import traceback
+        if manager is not None:
+            try:
+                live = (
+                    await manager.start_gateway()
+                )  # start messaging listeners (if configured)
+                if live:
+                    print(f"[coworker] messaging gateway live: {', '.join(live)}")
+            except Exception:  # never let a bad connector stop the server
+                import traceback
 
-            traceback.print_exc()
-        manager.start_team_worker()
+                traceback.print_exc()
+            manager.start_team_worker()
         yield
-        await manager.aclose()  # stop gateway + close MCP connections on shutdown
+        if manager is not None:
+            await manager.aclose()  # stop gateway + close MCP connections on shutdown
 
     app = FastAPI(title="coworker", version="0.0.0", lifespan=lifespan)
     api_token = os.environ.get("COWORKER_API_TOKEN", "")
@@ -232,17 +306,66 @@ def create_app(manager: SessionManager) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.add_middleware(
+        _StateMigrationBarrierMiddleware,
+        diagnostics_only=lambda: manager is None,
+    )
     app.state.manager = manager
+    retry_lock = asyncio.Lock()
 
     @app.get("/v1/health")
     def health(request: Request) -> dict[str, Any]:
         if api_token and not _request_authenticated(request):
-            return {"status": "ok"}
+            return {"status": "diagnostics" if manager is None else "ok"}
+        if manager is None:
+            return {
+                "status": "diagnostics",
+                "migration": migration_status().to_dict(),
+            }
         return {
             "status": "ok",
             "default_workspace": manager.default_workspace,
             "model": manager.model,
         }
+
+    @app.get("/v1/state-migration")
+    def state_migration_get() -> dict[str, Any]:
+        return migration_status().to_dict()
+
+    @app.get("/v1/state-migration/report")
+    def state_migration_report_get() -> dict[str, Any]:
+        return migration_report()
+
+    @app.post("/v1/state-migration/retry")
+    async def state_migration_retry() -> Any:
+        nonlocal manager
+        async with retry_lock:
+            if manager is not None:
+                return migration_status().to_dict()
+            try:
+                status = await asyncio.to_thread(bootstrap_state, force_retry=True)
+                if manager_factory is None:
+                    raise RuntimeError("manager factory is unavailable")
+                restored = await asyncio.to_thread(manager_factory)
+                live = await restored.start_gateway()
+                if live:
+                    print(f"[coworker] messaging gateway live: {', '.join(live)}")
+                restored.start_team_worker()
+            except StateMigrationError as exc:
+                return JSONResponse(exc.status.to_dict(), status_code=503)
+            except Exception:
+                return JSONResponse(
+                    {
+                        "error": {
+                            "code": "STATE_MANAGER_INIT_FAILED",
+                            "message": "State was migrated but the runtime could not start.",
+                        }
+                    },
+                    status_code=503,
+                )
+            manager = restored
+            app.state.manager = restored
+            return status.to_dict()
 
     @app.get("/v1/agents")
     def agents() -> dict[str, Any]:
@@ -1309,6 +1432,18 @@ def create_app(manager: SessionManager) -> FastAPI:
     # -- model providers (OpenAI, Ollama, …) ------------------------------------
     @app.get("/v1/providers")
     def providers_get() -> list[dict[str, Any]]:
+        if manager is None:
+            return [
+                {
+                    **descriptor.to_dict(),
+                    "configured": not descriptor.needs_key,
+                    "credential_source": None,
+                    "values": {},
+                    "suggested_models": [],
+                    "key_saved_at": None,
+                }
+                for descriptor in provider_descriptors()
+            ]
         return manager.get_providers()
 
     @app.post("/v1/providers")
@@ -1333,6 +1468,17 @@ def create_app(manager: SessionManager) -> FastAPI:
     # -- settings (model API key) -----------------------------------------------
     @app.get("/v1/settings")
     def settings_get() -> dict[str, Any]:
+        if manager is None:
+            return {
+                "diagnostics_only": True,
+                "model": None,
+                "models": [],
+                "provider": None,
+                "has_key": False,
+                "source": None,
+                "credential_source": None,
+                "migration": migration_status().to_dict(),
+            }
         return manager.get_settings()
 
     @app.post("/v1/settings/model-key")

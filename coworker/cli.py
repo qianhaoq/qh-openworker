@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -13,9 +14,18 @@ from .conversations import ConversationStore
 from .memory import SQLiteMemoryStore
 from .permissions import Mode
 from .secrets import state_dir
+from .state_migration import StateMigrationError, bootstrap_state
 
 
 def main(argv: Optional[list[str]] = None) -> None:
+    try:
+        bootstrap_state()
+    except StateMigrationError as exc:
+        print(
+            f"[openworker] state migration failed; report: {exc.report_path}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2) from None
     cfg = load_config()
     parser = argparse.ArgumentParser(
         prog="openworker", description="Agent coworker (TUI)."

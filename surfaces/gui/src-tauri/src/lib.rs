@@ -14,7 +14,7 @@
 //! passes `OPENAI_API_KEY` through. A Finder-launched app has no shell env — there the key
 //! comes from the SecretStore (Settings tab), see `coworker.providers.resolve_api_key`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 #[cfg(target_os = "windows")]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -108,6 +108,70 @@ fn state_dir() -> PathBuf {
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     PathBuf::from(home).join(".config").join("qh-openworker")
+}
+
+fn state_dir_env_override_set() -> bool {
+    std::env::var_os("QH_OPENWORKER_STATE_DIR").is_some()
+        || std::env::var_os("COWORKER_STATE_DIR").is_some()
+}
+
+fn legacy_state_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            return PathBuf::from(appdata).join("coworker");
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".config").join("coworker")
+}
+
+fn atomic_copy_if_absent(source: &Path, target: &Path) -> std::io::Result<bool> {
+    if target.exists() || !source.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if target.exists() {
+        return Ok(false);
+    }
+
+    let tmp = target.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::copy(source, &tmp)?;
+    match std::fs::hard_link(&tmp, target) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&tmp);
+            Ok(true)
+        }
+        Err(_err) if target.exists() => {
+            let _ = std::fs::remove_file(&tmp);
+            Ok(false)
+        }
+        Err(err) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(err)
+        }
+    }
+}
+
+/// Import only the desktop shell preference file from the legacy product identity.
+/// Python state remains owned by the Python bootstrap path.
+fn import_legacy_desktop_prefs() -> std::io::Result<bool> {
+    if state_dir_env_override_set() {
+        return Ok(false);
+    }
+    atomic_copy_if_absent(
+        &legacy_state_dir().join("desktop.json"),
+        &state_dir().join("desktop.json"),
+    )
 }
 
 fn desktop_prefs_path() -> PathBuf {
@@ -578,6 +642,9 @@ pub fn run() {
             install_update
         ])
         .setup(move |app| {
+            if let Err(e) = import_legacy_desktop_prefs() {
+                eprintln!("[coworker] failed to import legacy desktop preferences: {e}");
+            }
             // 1. Start the Python server sidecar on the chosen port (inherits our env).
             let mut server_cmd = Command::new(server_bin());
             server_cmd
@@ -722,4 +789,181 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    fn temp_root(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "openworker-desktop-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    struct EnvSnapshot {
+        qh_state: Option<std::ffi::OsString>,
+        coworker_state: Option<std::ffi::OsString>,
+        home: Option<std::ffi::OsString>,
+        appdata: Option<std::ffi::OsString>,
+    }
+
+    impl EnvSnapshot {
+        fn capture() -> Self {
+            Self {
+                qh_state: std::env::var_os("QH_OPENWORKER_STATE_DIR"),
+                coworker_state: std::env::var_os("COWORKER_STATE_DIR"),
+                home: std::env::var_os("HOME"),
+                appdata: std::env::var_os("APPDATA"),
+            }
+        }
+    }
+
+    impl Drop for EnvSnapshot {
+        fn drop(&mut self) {
+            restore_env("QH_OPENWORKER_STATE_DIR", self.qh_state.take());
+            restore_env("COWORKER_STATE_DIR", self.coworker_state.take());
+            restore_env("HOME", self.home.take());
+            restore_env("APPDATA", self.appdata.take());
+        }
+    }
+
+    fn clear_state_env_overrides() {
+        std::env::remove_var("QH_OPENWORKER_STATE_DIR");
+        std::env::remove_var("COWORKER_STATE_DIR");
+    }
+
+    #[cfg(windows)]
+    fn configure_default_root(root: &Path) {
+        std::env::set_var("APPDATA", root);
+    }
+
+    #[cfg(not(windows))]
+    fn configure_default_root(root: &Path) {
+        std::env::set_var("HOME", root);
+    }
+
+    #[test]
+    fn state_dir_does_not_create_files() {
+        let _guard = env_lock();
+        let _env = EnvSnapshot::capture();
+        let root = temp_root("pure-state-dir");
+        clear_state_env_overrides();
+        configure_default_root(&root);
+
+        let path = state_dir();
+
+        assert!(path.ends_with("qh-openworker"));
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn import_legacy_desktop_prefs_skips_when_state_env_is_overridden() {
+        let _guard = env_lock();
+        let _env = EnvSnapshot::capture();
+        let root = temp_root("override-skip");
+        clear_state_env_overrides();
+        configure_default_root(&root);
+        std::env::set_var("QH_OPENWORKER_STATE_DIR", root.join("explicit-new"));
+        let legacy = legacy_state_dir();
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("desktop.json"), r#"{"keep_awake":true}"#).unwrap();
+
+        let imported = import_legacy_desktop_prefs().unwrap();
+
+        assert!(!imported);
+        assert!(!root.join("explicit-new").join("desktop.json").exists());
+        assert!(legacy.join("desktop.json").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn import_legacy_desktop_prefs_skips_when_legacy_state_env_is_overridden() {
+        let _guard = env_lock();
+        let _env = EnvSnapshot::capture();
+        let root = temp_root("legacy-override-skip");
+        clear_state_env_overrides();
+        configure_default_root(&root);
+        let explicit_target = root.join("explicit-target");
+        std::env::set_var("COWORKER_STATE_DIR", &explicit_target);
+        let legacy = legacy_state_dir();
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("desktop.json"), r#"{"keep_awake":true}"#).unwrap();
+
+        let imported = import_legacy_desktop_prefs().unwrap();
+
+        assert!(!imported);
+        assert!(!explicit_target.join("desktop.json").exists());
+        assert!(legacy.join("desktop.json").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn import_legacy_desktop_prefs_keeps_existing_target() {
+        let _guard = env_lock();
+        let _env = EnvSnapshot::capture();
+        let root = temp_root("target-wins");
+        clear_state_env_overrides();
+        configure_default_root(&root);
+        let legacy = legacy_state_dir();
+        let target = desktop_prefs_path();
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(legacy.join("desktop.json"), r#"{"keep_awake":true}"#).unwrap();
+        std::fs::write(&target, r#"{"keep_awake":false}"#).unwrap();
+
+        let imported = import_legacy_desktop_prefs().unwrap();
+
+        assert!(!imported);
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            r#"{"keep_awake":false}"#
+        );
+        assert!(legacy.join("desktop.json").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn import_legacy_desktop_prefs_copies_default_legacy_file() {
+        let _guard = env_lock();
+        let _env = EnvSnapshot::capture();
+        let root = temp_root("default-import");
+        clear_state_env_overrides();
+        configure_default_root(&root);
+        let legacy = legacy_state_dir();
+        let target = desktop_prefs_path();
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("desktop.json"), r#"{"keep_awake":true}"#).unwrap();
+
+        let imported = import_legacy_desktop_prefs().unwrap();
+
+        assert!(imported);
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            r#"{"keep_awake":true}"#
+        );
+        assert!(legacy.join("desktop.json").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

@@ -19,6 +19,7 @@ import asyncio
 import sys
 
 from ..secrets import SecretStore
+from ..state_migration import StateMigrationError, bootstrap_state
 from .base import MessageEvent
 from .config import ConnectorSettings, load_settings
 from .fake import FakeAdapter
@@ -81,6 +82,14 @@ def _cmd_send(target: str, text: str) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    try:
+        bootstrap_state()
+    except StateMigrationError as exc:
+        print(
+            f"[openworker-connectors] state migration failed; report: {exc.report_path}",
+            file=sys.stderr,
+        )
+        return 2
     parser = argparse.ArgumentParser(prog="openworker-connectors")
     sub = parser.add_subparsers(dest="cmd", required=True)
 

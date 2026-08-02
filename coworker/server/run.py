@@ -8,9 +8,10 @@ import secrets
 import sys
 from pathlib import Path
 
-from ..config import load_config
+from ..config import Config, load_config
 from ..permissions import Mode
 from ..secrets import state_dir, write_private_text
+from ..state_migration import StateMigrationError, bootstrap_state
 from .app import _WS_MAX_FRAME_BYTES, create_app
 from .manager import SessionManager
 
@@ -99,14 +100,28 @@ def _watch_parent_windows(parent: int) -> None:
     threading.Thread(target=watch, daemon=True).start()
 
 
-def build_app(workspace: str | None, model: str, mode: str):
-    manager = SessionManager(
-        workspace=Path(workspace).expanduser().resolve() if workspace else None,
-        data_dir=state_dir(),
-        model=model,
-        mode=Mode(mode),
+def build_app(
+    workspace: str | None,
+    model: str,
+    mode: str,
+    *,
+    diagnostics_only: bool = False,
+    model_explicit: bool = True,
+    mode_explicit: bool = True,
+):
+    def manager_factory() -> SessionManager:
+        current = load_config() if diagnostics_only else None
+        return SessionManager(
+            workspace=Path(workspace).expanduser().resolve() if workspace else None,
+            data_dir=state_dir(),
+            model=model if model_explicit or current is None else current.model,
+            mode=Mode(mode if mode_explicit or current is None else current.mode),
+        )
+
+    return create_app(
+        None if diagnostics_only else manager_factory(),
+        manager_factory=manager_factory,
     )
-    return create_app(manager)
 
 
 def _ensure_ca_bundle() -> None:
@@ -125,12 +140,14 @@ def _ensure_ca_bundle() -> None:
         pass
 
 
-def _ensure_api_token(port: int) -> Path | None:
+def _ensure_api_token(port: int, *, persist: bool = True) -> Path | None:
     """Set launch auth; standalone/dev tokens use a user-only, port-specific file."""
     if os.environ.get("COWORKER_API_TOKEN"):
         return None  # Tauri supplied an in-memory token; never persist it.
     token = secrets.token_hex(32)
     os.environ["COWORKER_API_TOKEN"] = token
+    if not persist:
+        return None
     return write_private_text(
         state_dir() / f"sidecar-{port}.token", token + "\n"
     )
@@ -138,7 +155,16 @@ def _ensure_api_token(port: int) -> Path | None:
 
 def main(argv=None) -> None:
     _ensure_ca_bundle()
-    cfg = load_config()  # global config supplies defaults
+    diagnostics_only = False
+    try:
+        bootstrap_state()
+    except StateMigrationError as exc:
+        diagnostics_only = True
+        print(
+            f"[openworker] state migration failed; diagnostics only; report: {exc.report_path}",
+            file=sys.stderr,
+        )
+    cfg = Config() if diagnostics_only else load_config()
     parser = argparse.ArgumentParser(prog="openworker-server")
     parser.add_argument("--cwd", default=None, help="optional seed/default workspace")
     parser.add_argument("--model", default=cfg.model)
@@ -149,19 +175,27 @@ def main(argv=None) -> None:
     )
     parser.add_argument("--host", default=cfg.host)
     parser.add_argument("--port", type=int, default=cfg.port)
-    args = parser.parse_args(argv)
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    args = parser.parse_args(raw_argv)
 
     # Publish the ACTUAL bound port so loopback URLs (the managed-OAuth callback)
     # target this process, not config.port. The desktop shell runs the sidecar on
     # a random free port (to coexist with a hand-run server on 8765), so the
     # managed-connect redirect must follow the real port, not the 8765 default.
     os.environ["COWORKER_PORT"] = str(args.port)
-    generated_token_path = _ensure_api_token(args.port)
+    generated_token_path = _ensure_api_token(args.port, persist=not diagnostics_only)
     try:
         import uvicorn
 
         _exit_when_orphaned()
-        app = build_app(args.cwd, args.model, args.mode)
+        app = build_app(
+            args.cwd,
+            args.model,
+            args.mode,
+            diagnostics_only=diagnostics_only,
+            model_explicit=_option_present(raw_argv, "--model"),
+            mode_explicit=_option_present(raw_argv, "--mode"),
+        )
         uvicorn.run(
             app, host=args.host, port=args.port, ws_max_size=_WS_MAX_FRAME_BYTES
         )
@@ -169,6 +203,10 @@ def main(argv=None) -> None:
         if generated_token_path is not None:
             generated_token_path.unlink(missing_ok=True)
             os.environ.pop("COWORKER_API_TOKEN", None)
+
+
+def _option_present(argv: list[str], option: str) -> bool:
+    return any(item == option or item.startswith(option + "=") for item in argv)
 
 
 if __name__ == "__main__":

@@ -13,8 +13,8 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import re
+import copy
 import subprocess
 import sys
 import threading
@@ -46,7 +46,6 @@ def state_dir() -> Path:
         if appdata:
             return Path(appdata) / "qh-openworker"
     base = _home_dir() / ".config" / "qh-openworker"
-    _migrate_legacy_state_dir(base)
     return base
 
 
@@ -56,42 +55,6 @@ def _home_dir() -> Path:
 
 def _legacy_state_dir() -> Path:
     return _home_dir() / ".config" / "coworker"
-
-
-def _merge_trees(source: Path, destination: Path) -> None:
-    for entry in source.iterdir():
-        if entry.name.startswith("."):
-            # Keep hidden/legacy marker files untouched unless needed by secrets/.env migration.
-            if entry.name not in {".env"}:
-                continue
-        target = destination / entry.name
-        if entry.is_dir():
-            target.mkdir(parents=True, exist_ok=True)
-            _merge_trees(entry, target)
-            continue
-        if target.exists():
-            continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            shutil.copy2(entry, target)
-        except OSError:
-            pass
-
-
-def _migrate_legacy_state_dir(base: Path) -> None:
-    legacy = _legacy_state_dir()
-    if not legacy.is_dir() or legacy == base:
-        return
-    try:
-        destination = base / "migrated-from-legacy"
-        if destination.is_file():
-            return
-        if not base.exists():
-            base.mkdir(parents=True, exist_ok=True)
-        _merge_trees(legacy, base)
-        destination.touch(exist_ok=True)
-    except OSError:
-        pass
 
 
 def _load_dotenv(path: Path) -> dict[str, str]:
@@ -169,6 +132,12 @@ class SecretStore:
         if data is None:
             return None
         return self.resolve(data)
+
+    def get_raw(self, profile: str) -> Optional[dict[str, Any]]:
+        """Return the stored profile without resolving environment references."""
+
+        data = self._read().get(profile)
+        return copy.deepcopy(data) if isinstance(data, dict) else None
 
     def resolve(self, value: Any) -> Any:
         """Resolve `${VAR}` refs in a value (recursively) from env + the local `.env`."""
