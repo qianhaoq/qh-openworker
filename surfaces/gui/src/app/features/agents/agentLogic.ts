@@ -88,7 +88,7 @@ export const WORKSPACE_POLICIES = [
 
 export const PERMISSION_POLICIES = [
   { value: "coding-default", label: "写入、Shell、网络需审批" },
-  { value: "read-only", label: "永久只读" },
+  { value: "read-only", label: "宿主强制只读" },
   { value: "full-access", label: "Full Access（按 workspace 手动启用）" },
 ] as const;
 
@@ -309,7 +309,7 @@ export function validateProfile(
   if (id !== originalId && existingIds.has(id)) return `Profile ID "${id}" 已存在`;
   if (!draft.command.trim()) return "Command 不能为空";
   if (draft.role === "reviewer") {
-    if (draft.permission_policy !== "read-only") return "审查角色必须使用永久只读权限";
+    if (draft.permission_policy !== "read-only") return "审查角色必须使用宿主强制只读权限";
     if (draft.secret_refs.length > 0) return "审查角色不能引用 secret";
   }
   return null;

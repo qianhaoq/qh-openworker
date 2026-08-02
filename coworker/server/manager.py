@@ -86,6 +86,7 @@ from ..memory import MemoryStore, Scope, SQLiteMemoryStore
 from ..orchestration import (
     AgentProfile,
     AgentRole,
+    OrchestrationStoreError,
     Transport,
     WorktreeManager,
 )
@@ -97,7 +98,9 @@ from ..providers import (
     ProviderRouter,
     descriptor_configured,
     get_descriptor,
+    provider_credential_source,
     provider_descriptors,
+    resolve_provider_fields,
     verify_provider_key,
 )
 from ..secrets import SecretStore, state_dir
@@ -140,6 +143,7 @@ class SessionManager:
         )
         self.model = model
         self.mode = mode
+        self._provider_injected = provider is not None
         self.provider = provider
 
         if data_dir is not None:
@@ -402,6 +406,98 @@ class SessionManager:
                 return str(p.resolve())
             return None
         return self.default_workspace
+
+    def validate_session_runtime(
+        self,
+        session_id: str,
+        *,
+        runtime: str,
+        agent: str,
+        workspace: Optional[str],
+        profile_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Apply the new-session runtime gate without rewriting existing sessions."""
+
+        record = self.session_store.load(session_id)
+        if record is not None:
+            return {
+                "ok": True,
+                "runtime": runtime,
+                "model": record.model,
+                "workspace": record.workspace,
+            }
+        if runtime == "acp":
+            resolved = self.resolve_workspace(workspace)
+            if not resolved:
+                return {
+                    "ok": False,
+                    "code": "ACP_WORKSPACE_REQUIRED",
+                    "error": "ACP sessions require an existing workspace directory.",
+                    "runtime": "acp",
+                    "model": profile_id or "workspace-main",
+                }
+            try:
+                profile = self._usable_chat_profile(resolved, profile_id)
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "code": "ACP_PROFILE_UNUSABLE",
+                    "error": str(exc),
+                    "runtime": "acp",
+                    "model": profile_id or "workspace-main",
+                }
+            return {
+                "ok": True,
+                "runtime": "acp",
+                "model": profile.id,
+                "workspace": resolved,
+            }
+        # The desktop/server never injects a ProviderClient, so production Coding
+        # sessions always take the ACP path.  A directly injected provider is the
+        # explicit in-process host/test seam used by engine-level callers.
+        if agent == "code" and not self._provider_injected:
+            return {
+                "ok": False,
+                "code": "ACP_RUNTIME_REQUIRED",
+                "error": "Coding sessions require a workspace and a usable ACP Agent.",
+                "runtime": "embedded",
+                "model": self.model,
+            }
+        if not self._model_ready(self.model):
+            return {
+                "ok": False,
+                "code": "MODEL_NOT_READY",
+                "error": "Configure the current model before starting an embedded session.",
+                "runtime": "embedded",
+                "model": self.model,
+            }
+        return {
+            "ok": True,
+            "runtime": "embedded",
+            "model": self.model,
+            "workspace": workspace,
+        }
+
+    def _usable_chat_profile(
+        self, workspace: str | Path, profile_id: Optional[str]
+    ) -> AgentProfile:
+        if not profile_id:
+            return self._usable_main_profile(workspace)
+        profile = self.agent_profiles.get(str(profile_id).strip())
+        if profile is None:
+            raise ValueError(f"Agent profile not found: {profile_id}")
+        if not profile.enabled:
+            raise PermissionError(f"Agent profile is disabled: {profile_id}")
+        if profile.transport == Transport.EMBEDDED:
+            raise ValueError(f"Agent profile is not an ACP runtime: {profile_id}")
+        if not profile.has_current_capability_probe():
+            raise RuntimeError(f"Agent profile needs a current capability probe: {profile_id}")
+        return profile
+
+    def _model_ready(self, model: Optional[str] = None) -> bool:
+        if self._provider_injected:
+            return True
+        return self._provider_configured(self._model_provider(model or self.model))
 
     # -- engines ----------------------------------------------------------------
     def engine_workspace(
@@ -1491,7 +1587,8 @@ class SessionManager:
         """
         out: list[dict[str, Any]] = []
         for d in provider_descriptors():
-            profile = self.secrets.get(f"provider:{d.name}") or {}
+            raw_profile = self.secrets.get_raw(f"provider:{d.name}") or {}
+            profile = self.secrets.resolve(raw_profile)
             configured = descriptor_configured(d, profile)
             values = {
                 f.key: profile.get(f.key)
@@ -1502,6 +1599,9 @@ class SessionManager:
                 {
                     **d.to_dict(),
                     "configured": configured,
+                    "credential_source": provider_credential_source(
+                        d, raw_profile, profile
+                    ),
                     "values": values,
                     "suggested_models": self._suggested_models(d.name),
                     # Key hygiene for the Settings pane: when the key was saved (date, stamped
@@ -1605,7 +1705,7 @@ class SessionManager:
         if d is None:
             return {"ok": False, "error": f"unknown provider: {name}"}
         fields = fields or {}
-        profile = dict(self.secrets.get(f"provider:{name}") or {})
+        profile = dict(self.secrets.get_raw(f"provider:{name}") or {})
         for f in d.fields:
             if f.key not in fields:
                 continue
@@ -1616,7 +1716,7 @@ class SessionManager:
                 profile[f.key] = val
             elif not f.required:
                 profile.pop(f.key, None)
-        missing = [f.label for f in d.fields if f.required and not profile.get(f.key)]
+        _, missing = resolve_provider_fields(d, self.secrets.resolve(profile))
         if missing:
             return {"ok": False, "error": "missing: " + ", ".join(missing)}
         # A (re)pasted key stamps its save date — Settings shows "key added <date>" so stale
@@ -1666,25 +1766,18 @@ class SessionManager:
             return {"ok": False, "error": f"unknown provider: {name}"}
         fields = fields or {}
         profile = self.secrets.get(f"provider:{name}") or {}
-        merged = {}
-        for f in d.fields:
-            val = fields.get(f.key) or profile.get(f.key) or ""
-            if isinstance(val, str):
-                val = val.strip()
-            if val:
-                merged[f.key] = val
+        merged, missing = resolve_provider_fields(d, profile, fields)
+        if missing:
+            return {"ok": False, "error": "missing: " + ", ".join(missing)}
         api_key = merged.get("api_key", "")
         if not api_key and d.env_key:
             api_key = os.environ.get(d.env_key, "").strip()
         has_key_field = any(f.key == "api_key" for f in d.fields)
         if d.needs_key and has_key_field and not api_key:
             return {"ok": False, "error": "Enter an API key to test."}
-        if d.needs_key and not has_key_field:
-            # Multi-field cloud providers (Bedrock): required fields must be present;
-            # actual credentials may be ambient (~/.aws, env) and are checked by the call.
-            missing = [f.label for f in d.fields if f.required and not merged.get(f.key)]
-            if missing:
-                return {"ok": False, "error": "missing: " + ", ".join(missing)}
+        # Multi-field cloud providers (Bedrock) may use ambient credentials.  The shared
+        # resolver validates their descriptor fields; the provider-specific probe below
+        # validates the selected ambient authentication method.
         return verify_provider_key(
             name, api_key=api_key, base_url=merged.get("base_url", ""), fields=merged
         )
@@ -1902,10 +1995,11 @@ class SessionManager:
     def create_mission(self, payload: dict[str, Any]) -> dict[str, Any]:
         body = dict(payload or {})
         spec = body.get("task_spec") if isinstance(body.get("task_spec"), dict) else {}
-        workspace = body.get("workspace") or spec.get("workspace") or self.default_workspace
+        workspace = body.get("workspace") or spec.get("workspace")
+        if not workspace:
+            raise ValueError("mission workspace is required")
         main_profile_id: Optional[str] = None
-        if workspace:
-            main_profile_id = self.agent_profiles.get_workspace_main(workspace).id
+        main_profile_id = self._usable_main_profile(workspace).id
         return self.orchestrator.create_mission(
             body,
             main_profile_id=main_profile_id,
@@ -1916,20 +2010,29 @@ class SessionManager:
     ) -> dict[str, Any]:
         """Create a Mission and obtain its first structured plan from the main ACP Agent.
 
-        A provider/runtime failure falls back to the control-plane template, but the
-        persisted event and projection name that fallback explicitly.  Neither branch
-        starts an attempt; confirmation remains the only path to ``QUEUED``.
+        Operational profile/auth/launch/runtime failures persist a ``BLOCKED`` Mission.
+        Only an explicit control-plane request or invalid main-Agent output may use the
+        deterministic fallback proposal.  Neither branch starts an attempt.
         """
 
         body = dict(payload or {})
         spec = body.get("task_spec") if isinstance(body.get("task_spec"), dict) else {}
-        workspace_value = body.get("workspace") or spec.get("workspace") or self.default_workspace
-        workspace = str(Path(workspace_value).expanduser().resolve()) if workspace_value else None
-        main_profile_id: Optional[str] = None
-        if workspace:
-            main_profile_id = self.agent_profiles.get_workspace_main(workspace).id
+        workspace_value = body.get("workspace") or spec.get("workspace")
+        if not workspace_value:
+            raise ValueError("mission workspace is required")
+        workspace = str(Path(workspace_value).expanduser().resolve())
+        planning_mode = str(body.get("planning_mode") or "main_agent").strip()
+        if planning_mode not in {"main_agent", "control_plane"}:
+            raise ValueError("planning_mode must be main_agent or control_plane")
+        profile_error: Optional[Exception] = None
+        main_profile: Optional[AgentProfile] = None
+        try:
+            main_profile = self._usable_main_profile(workspace)
+        except Exception as exc:
+            profile_error = exc
+        main_profile_id = main_profile.id if main_profile is not None else None
         draft = self.orchestrator.create_mission(
-            body,
+            {**body, "workspace": workspace},
             main_profile_id=main_profile_id,
             defer_plan_proposal=True,
         )
@@ -1937,18 +2040,17 @@ class SessionManager:
             return draft
         mission_id = str(draft["mission_id"])
         draft_plan = dict(draft.get("plan") or {})
-        planning_mode = str(body.get("planning_mode") or "main_agent").strip()
-        if planning_mode != "main_agent" or not workspace:
-            reason = (
-                "main_agent_planning_disabled"
-                if planning_mode != "main_agent"
-                else "workspace_required_for_main_agent"
+        if profile_error is not None:
+            return self.orchestrator.block_mission_planning(
+                mission_id, self._mission_planning_error(profile_error)
             )
+        assert main_profile is not None
+        if planning_mode == "control_plane":
             return self.orchestrator.propose_mission_plan(
                 mission_id,
                 draft_plan,
                 source="control_plane_fallback",
-                fallback_reason=reason,
+                fallback_reason="explicit_control_plane",
             )
 
         profiles = [
@@ -1968,9 +2070,6 @@ class SessionManager:
             fallback_plan=draft_plan,
         )
         try:
-            main_profile = self.agent_profiles.get(str(main_profile_id or ""))
-            if main_profile is None:
-                raise ValueError("workspace main Agent profile is unavailable")
             turn, planning_session_id = await self._run_main_mission_planning_turn(
                 profile=main_profile,
                 workspace=workspace,
@@ -1978,26 +2077,88 @@ class SessionManager:
                 mission_id=mission_id,
                 prompt=planning_prompt,
             )
-            proposed = self._parse_main_mission_plan(turn.text)
-            return self.orchestrator.propose_mission_plan(
-                mission_id,
-                proposed,
-                source="main_agent",
-                agent_session_id=planning_session_id,
-            )
         except Exception as exc:
-            reason = type(exc).__name__
+            planning_error = self._mission_planning_error(exc)
             logger.warning(
-                "main ACP planning failed for mission %s; using explicit fallback (%s)",
+                "main ACP planning blocked mission %s (%s)",
                 mission_id,
-                reason,
+                planning_error["code"],
+            )
+            return self.orchestrator.block_mission_planning(
+                mission_id, planning_error
+            )
+
+        try:
+            proposed = self._parse_main_mission_plan(turn.text)
+        except ValueError as exc:
+            logger.warning(
+                "main ACP returned an invalid plan for mission %s; using fallback (%s)",
+                mission_id,
+                type(exc).__name__,
             )
             return self.orchestrator.propose_mission_plan(
                 mission_id,
                 draft_plan,
                 source="control_plane_fallback",
-                fallback_reason=reason,
+                fallback_reason="invalid_main_agent_output",
             )
+        return self.orchestrator.propose_mission_plan(
+            mission_id,
+            proposed,
+            source="main_agent",
+            agent_session_id=planning_session_id,
+        )
+
+    def _usable_main_profile(self, workspace: str | Path) -> AgentProfile:
+        path = Path(workspace).expanduser().resolve()
+        if not path.is_dir():
+            raise FileNotFoundError("workspace directory does not exist")
+        profile = self.agent_profiles.get_workspace_main(path)
+        if profile.role != AgentRole.MAIN:
+            raise ValueError("workspace main profile must have role=main")
+        if not profile.enabled:
+            raise PermissionError("workspace main ACP profile is disabled")
+        if profile.transport == Transport.EMBEDDED:
+            raise ValueError("workspace main profile must use ACP or JSONL-RPC")
+        if not profile.has_current_capability_probe():
+            raise RuntimeError("workspace main ACP profile requires a current capability probe")
+        return profile
+
+    @staticmethod
+    def _mission_planning_error(exc: Exception) -> dict[str, Any]:
+        name = type(exc).__name__.lower()
+        message = str(exc).lower()
+        if isinstance(exc, TimeoutError) or "timeout" in name:
+            return {
+                "code": "MAIN_ACP_TIMEOUT",
+                "message": "The workspace main ACP Agent timed out while planning.",
+                "retryable": True,
+            }
+        if any(token in message for token in ("auth", "login", "credential", "token")):
+            return {
+                "code": "MAIN_ACP_AUTH_REQUIRED",
+                "message": "The workspace main ACP Agent needs authentication.",
+                "retryable": True,
+            }
+        if isinstance(exc, (FileNotFoundError, PermissionError, KeyError, ValueError)) or any(
+            token in message for token in ("profile", "capability probe")
+        ):
+            return {
+                "code": "MAIN_ACP_PROFILE_UNUSABLE",
+                "message": "The workspace needs an enabled, probed main ACP Agent profile.",
+                "retryable": False,
+            }
+        if isinstance(exc, OSError) or "process" in name or "launch" in message:
+            return {
+                "code": "MAIN_ACP_LAUNCH_FAILED",
+                "message": "The workspace main ACP Agent could not be launched.",
+                "retryable": True,
+            }
+        return {
+            "code": "MAIN_ACP_RUNTIME_ERROR",
+            "message": "The workspace main ACP Agent failed while planning.",
+            "retryable": True,
+        }
 
     async def _run_main_mission_planning_turn(
         self,
@@ -4046,8 +4207,19 @@ class SessionManager:
         """Model-access + UI status. Never returns the key; `source` says where it comes from."""
         import os
 
-        env_key = bool(os.environ.get("OPENAI_API_KEY"))
-        stored = bool((self.secrets.get("provider:openai") or {}).get("api_key"))
+        current_provider = self._model_provider(self.model)
+        current_descriptor = get_descriptor(current_provider)
+        current_profile = self.secrets.get_raw(f"provider:{current_provider}") or {}
+        credential_source = (
+            provider_credential_source(
+                current_descriptor,
+                current_profile,
+                self.secrets.resolve(current_profile),
+            )
+            if current_descriptor is not None
+            else None
+        )
+        legacy_source = "env" if credential_source in {"env", "mixed"} else credential_source
         # Only surface models whose provider is actually configured — the composer picker
         # reflects exactly what's connected. The active default is always kept selectable
         # (it's hidden behind the "No model" state until a provider is connected anyway).
@@ -4065,7 +4237,7 @@ class SessionManager:
         from ..providers.matrix import model_context_windows, model_labels
 
         return {
-            "provider": "openai",
+            "provider": current_provider,
             "model": self.model,
             "models": selectable,
             # Curated-matrix display names ({full id → "GLM-5.2 · via Together"}) so every
@@ -4074,12 +4246,13 @@ class SessionManager:
             # {full id → context window in tokens}, verified matrix entries only —
             # drives the composer's context-fill meter (absent id → meter hides).
             "model_context_windows": model_context_windows(),
-            "has_key": env_key or stored,
+            "has_key": self._provider_configured(current_provider),
             # Provider-agnostic "can this default model actually run?" — true when the default
             # model's provider is configured (any provider, not just OpenAI). Drives the GUI's
             # "No model connected" composer chip and the onboarding Skip warning.
-            "model_ready": self._provider_configured(self._model_provider(self.model)),
-            "source": "env" if env_key else ("store" if stored else None),
+            "model_ready": self._model_ready(self.model),
+            "source": legacy_source,
+            "credential_source": credential_source,
             "onboarded": bool(self._prefs.get("onboarded")),
             "experimental_connectors": experimental_enabled(self.secrets),
             "surfaces": self._surfaces(),
@@ -4272,7 +4445,7 @@ class SessionManager:
         if not api_key:
             return {"ok": False, "error": "empty api key"}
         # Merge, don't replace: the profile may also hold a custom endpoint (base_url).
-        profile = dict(self.secrets.get("provider:openai") or {})
+        profile = dict(self.secrets.get_raw("provider:openai") or {})
         profile.update({"type": "api_key", "api_key": api_key})
         self.secrets.put("provider:openai", profile)
         self._refresh_provider("openai")  # rebuild the OpenAI client with the new key
@@ -4832,6 +5005,9 @@ class SessionManager:
         await self.mcp.aclose()
         self.orchestrator.close()
         self.audit_store.close()
+        self.memory_store.close()
+        self.session_store.close()
+        self.task_store.close()
 
     # -- automation (scheduled tasks) -------------------------------------------
     def approval_prompt_data(self, session_id: str, request) -> dict[str, Any]:

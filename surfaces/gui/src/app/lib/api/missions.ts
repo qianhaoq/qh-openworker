@@ -52,6 +52,8 @@ function missionFromResponse(value: any): Mission {
       mission.needs_user_action ??
         (state === "AWAITING_CONFIRMATION" || state === "BLOCKED"),
     ),
+    planning_error: mission.planning_error ?? null,
+    fallback_used: Boolean(mission.fallback_used),
     last_cursor: mission.last_cursor == null ? null : String(mission.last_cursor),
   } as Mission;
 }

@@ -26,6 +26,7 @@ import {
   memberStatusMeta,
   missionMatchesFilter,
   missionNeedsAttention,
+  missionPlanningErrorText,
   missionTitle,
   parseDependsOnInput,
   planDraftFromPlan,
@@ -37,6 +38,7 @@ import {
   sortMissionsByUpdated,
   stateMeta,
   updatePlanMember,
+  validateMissionWorkspace,
   validatePlanDraft,
   type PlanDraft,
 } from "./missionLogic";
@@ -194,6 +196,29 @@ describe("missionTitle", () => {
     expect(missionTitle(makeMission({ plan: makePlan({ goal: "计划目标" }) }))).toBe("计划目标");
     expect(missionTitle(makeMission({ goal: "裸目标" }))).toBe("裸目标");
     expect(missionTitle(makeMission({ goal: "", mission_id: "m-9" }))).toBe("m-9");
+  });
+});
+
+describe("mission planning contracts", () => {
+  it("renders a safe planning error summary", () => {
+    expect(missionPlanningErrorText(makeMission({ planning_error: null }))).toBeNull();
+    expect(
+      missionPlanningErrorText(
+        makeMission({
+          planning_error: {
+            code: "ACP_PROFILE_UNUSABLE",
+            message: "主 Agent profile 不可用",
+            retryable: true,
+          },
+        }),
+      ),
+    ).toBe("规划失败：主 Agent profile 不可用");
+  });
+
+  it("requires a workspace before creating a mission", () => {
+    expect(validateMissionWorkspace("")).toBe("请选择 workspace");
+    expect(validateMissionWorkspace("  ")).toBe("请选择 workspace");
+    expect(validateMissionWorkspace("/repo")).toBeNull();
   });
 });
 

@@ -78,6 +78,15 @@ export const isMissionTerminal = (state?: string): boolean =>
 export const missionNeedsAttention = (mission: Mission): boolean =>
   Boolean(mission.needs_user_action) || ATTENTION_STATES.has(mission.state);
 
+export const missionPlanningErrorText = (mission: Mission): string | null => {
+  if (!mission.planning_error) return null;
+  const message = mission.planning_error.message || mission.planning_error.code;
+  return message ? `规划失败：${message}` : "规划失败";
+};
+
+export const validateMissionWorkspace = (workspace: string): string | null =>
+  workspace.trim() ? null : "请选择 workspace";
+
 /** Runtime status of a plan seat / attempt ("planned", "running", "completed", …). */
 export function memberStatusMeta(status?: string): StateMeta {
   switch (String(status ?? "")) {

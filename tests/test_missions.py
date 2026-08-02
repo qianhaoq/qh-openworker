@@ -256,18 +256,32 @@ async def test_main_acp_proposes_structured_plan_before_confirmation(tmp_path):
             mission["mission_id"],
             {"profile_id": "opencode-executor", "role": "executor"},
         )
-    manager.orchestrator.close()
+    await manager.aclose()
 
 
 def test_mission_rest_websocket_and_profile_delete_contract(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
     manager = SessionManager(data_dir=tmp_path / "data")
     manager.start_team_worker = lambda: None  # type: ignore[method-assign]
     app = create_app(manager)
 
     with TestClient(app) as client:
+        missing = client.post(
+            "/v1/missions",
+            json={"goal": "Must not create without a workspace"},
+        )
+        assert missing.status_code == 422
+        assert missing.json()["detail"]["code"] == "MISSION_WORKSPACE_REQUIRED"
+        assert client.get("/v1/missions").json()["missions"] == []
+
         created = client.post(
             "/v1/missions",
-            json={"goal": "Exercise the desktop Mission API"},
+            json={
+                "goal": "Exercise the desktop Mission API",
+                "workspace": str(workspace),
+                "planning_mode": "control_plane",
+            },
         )
         assert created.status_code == 200
         mission = created.json()
@@ -276,8 +290,10 @@ def test_mission_rest_websocket_and_profile_delete_contract(tmp_path):
         assert mission["plan_proposal"]["source"] == "control_plane_fallback"
         assert (
             mission["plan_proposal"]["fallback_reason"]
-            == "workspace_required_for_main_agent"
+            == "explicit_control_plane"
         )
+        assert mission["fallback_used"] is True
+        assert mission["planning_error"] is None
 
         listed = client.get("/v1/missions").json()
         assert [item["mission_id"] for item in listed["missions"]] == [mission_id]
@@ -333,6 +349,70 @@ def test_mission_rest_websocket_and_profile_delete_contract(tmp_path):
         assert deleted.status_code == 200
         assert deleted.json()["deleted"] is True
         assert client.delete("/v1/agent-profiles/temporary-explorer").status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_mission_operational_planning_failure_persists_blocked_without_fallback(
+    tmp_path,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manager = SessionManager(workspace=workspace, data_dir=tmp_path / "data")
+
+    class AuthFailureAdapter:
+        async def open_session(self, profile, *, cwd, checkpoint, mcp_servers):
+            return SimpleNamespace(session_id="auth-failed", capabilities={})
+
+        async def prompt(self, handle, prompt):
+            raise RuntimeError("authentication token required")
+
+        async def close(self, handle):
+            return None
+
+    manager.acp_adapter = AuthFailureAdapter()  # type: ignore[assignment]
+    mission = await manager.create_mission_with_main_planning(
+        {"goal": "Plan only after auth", "workspace": str(workspace)}
+    )
+
+    assert mission["state"] == "BLOCKED"
+    assert mission["fallback_used"] is False
+    assert mission["planning_error"] == {
+        "code": "MAIN_ACP_AUTH_REQUIRED",
+        "message": "The workspace main ACP Agent needs authentication.",
+        "retryable": True,
+    }
+    assert mission["plan_proposal"]["source"] is None
+    assert any(event["type"] == "mission.planning_blocked" for event in mission["timeline"])
+    await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_mission_invalid_main_output_uses_explicit_fallback(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manager = SessionManager(workspace=workspace, data_dir=tmp_path / "data")
+
+    class InvalidOutputAdapter:
+        async def open_session(self, profile, *, cwd, checkpoint, mcp_servers):
+            return SimpleNamespace(session_id="invalid-output", capabilities={})
+
+        async def prompt(self, handle, prompt):
+            return SimpleNamespace(text="this is not a plan")
+
+        async def close(self, handle):
+            return None
+
+    manager.acp_adapter = InvalidOutputAdapter()  # type: ignore[assignment]
+    mission = await manager.create_mission_with_main_planning(
+        {"goal": "Use a safe fallback", "workspace": str(workspace)}
+    )
+
+    assert mission["state"] == "AWAITING_CONFIRMATION"
+    assert mission["planning_error"] is None
+    assert mission["fallback_used"] is True
+    assert mission["plan_proposal"]["source"] == "control_plane_fallback"
+    assert mission["plan_proposal"]["fallback_reason"] == "invalid_main_agent_output"
+    await manager.aclose()
 
 
 def test_manager_attempt_default_uses_executor_profile(tmp_path):

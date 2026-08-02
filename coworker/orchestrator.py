@@ -258,6 +258,8 @@ class QhOrchestratorStore:
                 "plan_proposal_source": str(source),
                 "plan_proposal_agent_session_id": agent_session_id,
                 "plan_proposal_fallback_reason": fallback_reason,
+                "fallback_used": str(source) == "control_plane_fallback",
+                "planning_error": None,
             }
         )
         spec["_orchestration"] = control
@@ -284,6 +286,53 @@ class QhOrchestratorStore:
             mission_id,
             TaskStatus.AWAITING_CONFIRMATION,
             event_id=f"{mission_id}:transition:planning:awaiting_confirmation",
+        )
+        return self.get_mission(mission_id)
+
+    def block_mission_planning(
+        self, mission_id: str, planning_error: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Persist an operational planning failure without pretending a plan succeeded."""
+
+        task = self.store.get_task(mission_id)
+        if not task:
+            raise KeyError(mission_id)
+        if task.status != TaskStatus.PLANNING:
+            raise OrchestrationStoreError("mission is no longer planning")
+        safe_error = {
+            "code": str(planning_error.get("code") or "MAIN_ACP_RUNTIME_ERROR"),
+            "message": str(
+                planning_error.get("message")
+                or "The workspace main ACP Agent could not create a plan."
+            ),
+            "retryable": bool(planning_error.get("retryable", True)),
+        }
+        spec = dict(task.task_spec)
+        control = dict(spec.get("_orchestration") or {})
+        control.update(
+            {
+                "planning_error": safe_error,
+                "fallback_used": False,
+                "plan_proposal_source": None,
+                "plan_proposal_agent_session_id": None,
+                "plan_proposal_fallback_reason": None,
+            }
+        )
+        spec["_orchestration"] = control
+        self.store.update_task_spec(mission_id, spec)
+        self.store.append_event(
+            LedgerEvent(
+                event_id=f"{mission_id}:planning_blocked",
+                event_type="mission.planning_blocked",
+                aggregate_type="task",
+                aggregate_id=mission_id,
+                payload={"planning_error": safe_error},
+            )
+        )
+        self.store.transition_task(
+            mission_id,
+            TaskStatus.BLOCKED,
+            event_id=f"{mission_id}:transition:planning:blocked",
         )
         return self.get_mission(mission_id)
 
@@ -339,10 +388,13 @@ class QhOrchestratorStore:
             "target_profile_id": control.get("target_profile_id"),
             "target_session_id": control.get("target_session_id"),
             "plan_proposal": {
-                "source": control.get("plan_proposal_source") or "control_plane",
+                "source": control.get("plan_proposal_source")
+                or (None if control.get("planning_error") else "control_plane"),
                 "agent_session_id": control.get("plan_proposal_agent_session_id"),
                 "fallback_reason": control.get("plan_proposal_fallback_reason"),
             },
+            "planning_error": control.get("planning_error"),
+            "fallback_used": bool(control.get("fallback_used", False)),
             "attempts": [attempt.to_dict() for attempt in attempts],
             "artifacts": [artifact.to_dict() for artifact in artifacts],
             "reviews": [review.to_dict() for review in reviews],

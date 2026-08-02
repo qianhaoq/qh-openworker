@@ -9,6 +9,8 @@ import {
   canSubmitProvider,
   clampInt,
   compactionDraftFromSettings,
+  credentialSource,
+  credentialSourceLabel,
   defaultModelOptions,
   dictationReady,
   downloadPercent,
@@ -202,6 +204,21 @@ describe("providerStatus", () => {
       tone: "faint",
     });
     expect(providerStatus(provider({}))).toEqual({ label: "未配置", tone: "faint" });
+  });
+});
+
+describe("credentialSource", () => {
+  it("prefers credential_source and falls back to legacy source", () => {
+    expect(credentialSource(provider({ credential_source: "mixed", source: "env" }))).toBe("mixed");
+    expect(credentialSource(provider({ source: "store" }))).toBe("store");
+    expect(credentialSource(provider({}))).toBeNull();
+  });
+
+  it("labels credential sources without exposing key names", () => {
+    expect(credentialSourceLabel("env")).toBe("环境变量");
+    expect(credentialSourceLabel("store")).toBe("本地密钥库");
+    expect(credentialSourceLabel("mixed")).toBe("混合来源");
+    expect(credentialSourceLabel(null)).toBeNull();
   });
 });
 

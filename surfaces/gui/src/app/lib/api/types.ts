@@ -453,6 +453,8 @@ export interface Mission extends TeamTaskResult {
   timeline: MissionTimelineEvent[];
   permissions: AgentPermission[];
   needs_user_action: boolean;
+  planning_error?: { code: string; message: string; retryable: boolean } | null;
+  fallback_used: boolean;
   last_cursor?: string | null;
 }
 
@@ -473,7 +475,7 @@ export type MessageTarget = { kind: "main" } | { kind: "attempt"; attempt_id: st
 export interface MissionCreateInput {
   goal: string;
   title?: string;
-  workspace?: string | null;
+  workspace: string;
   conversation_id?: string;
   max_rework_rounds?: number;
   planning_mode?: string;
@@ -797,6 +799,7 @@ export interface Settings {
   has_key: boolean;
   model_ready: boolean;
   source: "env" | "store" | null;
+  credential_source?: "env" | "store" | "mixed" | null;
   onboarded: boolean;
   surfaces: SurfaceVisibility;
   scratch_base: string;
@@ -852,6 +855,8 @@ export interface ProviderInfo {
   blurb?: string;
   key_set_at?: string | null;
   last_used_at?: number | null;
+  credential_source?: "env" | "store" | "mixed" | null;
+  source?: "env" | "store" | "mixed" | null;
 }
 
 export type MemoryScope = "global" | "workspace" | "session";

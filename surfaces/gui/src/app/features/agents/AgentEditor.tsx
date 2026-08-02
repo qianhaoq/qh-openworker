@@ -291,6 +291,9 @@ export function AgentEditor({
           </div>
 
           <div className={GRP_H}>权限与密钥</div>
+          <p className="mb-1 px-1 text-[11px] leading-snug text-faint">
+            这些是宿主强制的 ACP 权限策略；Agent 二进制是受信本地代码，不等同 OS sandbox。
+          </p>
           <div className={`${GRP} divide-y divide-line`}>
             <Field label="Workspace">
               <select

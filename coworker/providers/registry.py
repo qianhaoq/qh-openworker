@@ -17,6 +17,7 @@ MaaS endpoint), and `ollama` (local, OpenAI-compatible `/v1`).
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -595,12 +596,110 @@ def descriptor_configured(d: ProviderDescriptor, profile: dict[str, Any]) -> boo
     """
     if not d.needs_key:
         return True  # keyless (Ollama) — usable out of the box
+    _, missing = resolve_provider_fields(d, profile)
+    return not missing
+
+
+def resolve_provider_fields(
+    descriptor: ProviderDescriptor,
+    stored: Optional[dict[str, Any]] = None,
+    supplied: Optional[dict[str, Any]] = None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Resolve one provider form without persisting ambient credentials.
+
+    Save and Verify both use this resolver so conditional/default fields and env-only API
+    keys have one contract.  Environment values are used only to satisfy/runtime-verify the
+    descriptor; they are deliberately absent from the returned mapping so callers can never
+    copy a process secret into :class:`SecretStore` by accident.
+    """
+
+    stored = stored or {}
+    supplied = supplied or {}
+    resolved: dict[str, Any] = {}
+    ambient_fields: set[str] = set()
+    for field in descriptor.fields:
+        value = supplied.get(field.key)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            value = stored.get(field.key)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            value = field.default
+        if isinstance(value, str):
+            value = value.strip()
+        env_ref = _environment_reference(value) if field.secret else None
+        if env_ref is not None:
+            if os.environ.get(env_ref, "").strip():
+                ambient_fields.add(field.key)
+            # Never return an ambient secret (or an unresolved placeholder) to callers.
+            continue
+        if value not in (None, ""):
+            resolved[field.key] = value
+
+    missing: list[str] = []
+    for field in descriptor.fields:
+        if not field.required:
+            continue
+        if field.show_when and any(
+            resolved.get(key) != expected for key, expected in field.show_when.items()
+        ):
+            continue
+        if resolved.get(field.key) not in (None, ""):
+            continue
+        if field.key in ambient_fields:
+            continue
+        if field.key == "api_key" and descriptor.env_key:
+            if os.environ.get(descriptor.env_key, "").strip():
+                continue
+        missing.append(field.label)
+    return resolved, missing
+
+
+def provider_credential_source(
+    descriptor: ProviderDescriptor,
+    profile: Optional[dict[str, Any]] = None,
+    resolved_profile: Optional[dict[str, Any]] = None,
+) -> Optional[str]:
+    """Return credential provenance without exposing names or values."""
+
     profile = profile or {}
-    if any(f.key == "api_key" for f in d.fields):
-        return bool(profile.get("api_key")) or bool(
-            d.env_key and os.environ.get(d.env_key)
+    resolved_profile = resolved_profile or {}
+    stored = False
+    env_refs = False
+    for field in descriptor.fields:
+        if not field.secret:
+            continue
+        value = profile.get(field.key)
+        if value in (None, ""):
+            continue
+        env_ref = _environment_reference(value)
+        if env_ref is None:
+            stored = True
+            continue
+        resolved_value = resolved_profile.get(field.key)
+        env_refs = env_refs or bool(
+            os.environ.get(env_ref, "").strip()
+            or (
+                resolved_value not in (None, "")
+                and resolved_value != value
+                and _environment_reference(resolved_value) is None
+            )
         )
-    return all(profile.get(f.key) for f in d.fields if f.required)
+    env = bool(
+        descriptor.env_key and os.environ.get(descriptor.env_key, "").strip()
+    ) or env_refs
+    if stored and env:
+        return "mixed"
+    if env:
+        return "env"
+    if stored:
+        return "store"
+    return None
+
+
+def _environment_reference(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", value.strip())
+    return match.group(1) if match else None
 
 
 def detect_provider(api_key: str) -> Optional[str]:

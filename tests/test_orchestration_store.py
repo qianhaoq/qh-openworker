@@ -93,6 +93,35 @@ def test_profile_roundtrip_workspace_main_and_session_capabilities(tmp_path):
     store.close()
 
 
+def test_workspace_main_profile_uses_canonical_path_aliases(tmp_path):
+    store = _store(tmp_path)
+    main, _, _ = _profiles(store)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    alias = tmp_path / "workspace-alias"
+    alias.symlink_to(workspace, target_is_directory=True)
+
+    store.set_workspace_main_profile(alias, main.id)
+
+    assert store.get_workspace_main_profile(workspace).id == main.id
+
+    # A pre-canonicalization row is discovered from the real path and upgraded lazily.
+    store._db.execute("DELETE FROM workspace_agent_profiles")
+    store._db.execute(
+        "INSERT INTO workspace_agent_profiles(workspace, main_profile_id) VALUES (?, ?)",
+        (str(alias), main.id),
+    )
+    store._db.commit()
+    assert store.get_workspace_main_profile(workspace).id == main.id
+    upgraded = store._db.execute(
+        "SELECT main_profile_id FROM workspace_agent_profiles WHERE workspace = ?",
+        (str(workspace.resolve()),),
+    ).fetchone()
+    assert upgraded["main_profile_id"] == main.id
+    store.close()
+
+
 def test_seed_default_profiles_preserves_user_configuration_and_capabilities(tmp_path):
     store = _store(tmp_path)
     store.seed_default_profiles()

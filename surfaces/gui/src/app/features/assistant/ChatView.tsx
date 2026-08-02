@@ -3,11 +3,19 @@
 // All session IO lives in useSessionChat; this file is layout + view state.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { getWorkspaceMainAgent } from "../../lib/api/agents";
 import { getSettings } from "../../lib/api/settings";
-import { getUnattended, setUnattended } from "../../lib/api/sessions";
-import type { Attachment, Session, Settings } from "../../lib/api/types";
+import {
+  getRecentWorkspaces,
+  getUnattended,
+  openWorkspace,
+  pickFolderViaServer,
+  setUnattended,
+} from "../../lib/api/sessions";
+import type { Attachment, RecentWorkspace, Session, Settings } from "../../lib/api/types";
 import { navigate } from "../../nav";
 import { Icon } from "../../components/Icon";
+import { isProfileUsable } from "../agents/agentLogic";
 import { AgentPicker } from "./AgentPicker";
 import {
   agentChoiceLabel,
@@ -48,7 +56,9 @@ export interface ChatViewProps {
 
 export function ChatView({ session, sessionId, railOpen, onToggleRail, onSessionsChanged }: ChatViewProps) {
   const agent = session?.agent || "cowork";
-  const workspace = session?.workspace || "";
+  const [localWorkspace, setLocalWorkspace] = useState("");
+  const workspace = session?.workspace || localWorkspace;
+  const isNewSession = session === null;
 
   // -- agent picker (内置助理 ↔ ACP workspace main ↔ a bound profile) -------------------
   // Stored per session ("assistant:agent:{id}"); absent = default (code agent → acp).
@@ -64,25 +74,82 @@ export function ChatView({ session, sessionId, railOpen, onToggleRail, onSession
     saveAgentChoice(sessionId, next);
   };
 
+  // -- settings (model list for the composer) ----------------------------------------------
+  const [settings, setSettings] = useState<Settings | null>(null);
+  useEffect(() => {
+    getSettings().then(setSettings).catch(() => {});
+  }, []);
+
+  const [recentWorkspaces, setRecentWorkspaces] = useState<RecentWorkspace[]>([]);
+  useEffect(() => {
+    if (!isNewSession) return;
+    let stale = false;
+    getRecentWorkspaces()
+      .then((list) => !stale && setRecentWorkspaces(list))
+      .catch(() => {});
+    return () => {
+      stale = true;
+    };
+  }, [isNewSession]);
+
+  const [mainAcpReady, setMainAcpReady] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (!isNewSession || agentChoice !== "acp" || !workspace.trim()) {
+      setMainAcpReady(null);
+      return;
+    }
+    let stale = false;
+    getWorkspaceMainAgent(workspace)
+      .then(({ profile }) => {
+        if (stale) return;
+        setMainAcpReady(
+          profile.role === "main" &&
+            profile.transport !== "embedded" &&
+            isProfileUsable(profile),
+        );
+      })
+      .catch(() => !stale && setMainAcpReady(false));
+    return () => {
+      stale = true;
+    };
+  }, [agentChoice, isNewSession, workspace]);
+
+  const pickWorkspace = async () => {
+    const picked = await pickFolderViaServer();
+    if (!picked) return;
+    const opened = await openWorkspace(picked).catch(() => null);
+    setLocalWorkspace(opened?.ok && opened.path ? opened.path : picked);
+    selectAgent("acp");
+  };
+
   // -- the session itself -----------------------------------------------------------------
   const [turnSettledKey, setTurnSettledKey] = useState(0);
+  const wantsAcp = agentChoice !== "embedded" || agent === "code";
+  const embeddedBlocked =
+    isNewSession && agentChoice === "embedded" && settings?.model_ready === false;
+  const workspaceBlocked = isNewSession && wantsAcp && !workspace.trim();
+  const mainAcpBlocked =
+    isNewSession && agentChoice === "acp" && Boolean(workspace.trim()) && mainAcpReady === false;
+  const mainAcpChecking =
+    isNewSession && agentChoice === "acp" && Boolean(workspace.trim()) && mainAcpReady === null;
+  const connectSession =
+    !embeddedBlocked &&
+    !workspaceBlocked &&
+    !mainAcpBlocked &&
+    !mainAcpChecking &&
+    (!isNewSession || settings !== null);
   const chat = useSessionChat({
     sessionId,
     workspace,
     agent,
     agentChoice,
+    connect: connectSession,
     onTurnSettled: useCallback(() => {
       setTurnSettledKey((k) => k + 1);
       onSessionsChanged();
     }, [onSessionsChanged]),
   });
   const { state } = chat;
-
-  // -- settings (model list for the composer) ----------------------------------------------
-  const [settings, setSettings] = useState<Settings | null>(null);
-  useEffect(() => {
-    getSettings().then(setSettings).catch(() => {});
-  }, []);
 
   // -- unattended ---------------------------------------------------------------------------
   const [unattended, setUnattendedState] = useState(false);
@@ -167,6 +234,7 @@ export function ChatView({ session, sessionId, railOpen, onToggleRail, onSession
   }, [state.items, state.streaming]);
 
   const send = (text: string, attachments?: Attachment[]) => {
+    if (!connectSession) return;
     chat.send(text, attachments, model || undefined);
     followLatest(); // sending always re-engages stream-following
   };
@@ -177,6 +245,13 @@ export function ChatView({ session, sessionId, railOpen, onToggleRail, onSession
   const acpName = agentChoice === "embedded" ? null : agentChoiceLabel(agentChoice);
   const agentDisplay: TimelineAgent =
     agentChoice === "embedded" ? { kind: "q" } : { kind: "acp", name: acpName ?? "ACP" };
+  const gateMessage = embeddedBlocked
+    ? "当前模型未配置。配置模型，或选择 workspace 使用 ACP。"
+    : workspaceBlocked
+      ? "ACP 会话需要先选择 workspace。"
+      : mainAcpBlocked
+        ? "该 workspace 尚未配置可用的 main ACP Agent。"
+        : null;
 
   return (
     <div className="flex h-full min-w-0 flex-1">
@@ -223,11 +298,63 @@ export function ChatView({ session, sessionId, railOpen, onToggleRail, onSession
                 <p className="mt-1.5 max-w-sm text-[13px] leading-relaxed text-muted">
                   我是 Q，你的本地工作伙伴 — 直接说事儿就好，或从下面挑一个开始。
                 </p>
+                {gateMessage && (
+                  <div
+                    data-testid="new-session-runtime-gate"
+                    className="mt-5 w-full max-w-md rounded-xl bg-warnSoft px-3.5 py-3 text-left text-[12.5px] leading-relaxed text-warnInk"
+                  >
+                    <div>{gateMessage}</div>
+                    <div className="mt-2 flex flex-wrap items-center gap-2">
+                      {embeddedBlocked && (
+                        <button
+                          type="button"
+                          onClick={() => navigate("settings")}
+                          className="flex items-center gap-1 rounded-lg border border-warnInk/30 bg-panel/60 px-2.5 py-1 text-[12px] font-medium"
+                        >
+                          <Icon name="settings" size={13} />
+                          配置模型
+                        </button>
+                      )}
+                      {mainAcpBlocked && (
+                        <button
+                          type="button"
+                          onClick={() => navigate("agents")}
+                          className="flex items-center gap-1 rounded-lg border border-warnInk/30 bg-panel/60 px-2.5 py-1 text-[12px] font-medium"
+                        >
+                          <Icon name="settings" size={13} />
+                          配置 main Agent
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => void pickWorkspace()}
+                        className="flex items-center gap-1 rounded-lg border border-warnInk/30 bg-panel/60 px-2.5 py-1 text-[12px] font-medium"
+                      >
+                        <Icon name="folder" size={13} />
+                        选择 workspace 使用 ACP
+                      </button>
+                      {recentWorkspaces.slice(0, 2).map((item) => (
+                        <button
+                          key={item.path}
+                          type="button"
+                          onClick={() => {
+                            setLocalWorkspace(item.path);
+                            selectAgent("acp");
+                          }}
+                          className="rounded-lg border border-warnInk/20 bg-panel/40 px-2.5 py-1 text-[12px]"
+                        >
+                          {item.name || item.path}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
                 <div className="mt-6 grid w-full max-w-md gap-2">
                   {SUGGESTIONS.map((s, i) => (
                     <button
                       key={i}
                       type="button"
+                      disabled={!connectSession}
                       className="flex items-center gap-2.5 rounded-xl border border-line bg-panel px-3.5 py-2.5 text-left text-[13px] text-ink hover:border-lineStrong"
                       onClick={() => send(s.text)}
                     >

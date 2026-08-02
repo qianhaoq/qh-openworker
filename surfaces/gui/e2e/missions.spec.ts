@@ -63,12 +63,58 @@ test("creating a mission navigates to its detail page", async ({ page }) => {
   await page.getByRole("button", { name: /新建任务/ }).first().click();
 
   const drawer = page.getByRole("dialog", { name: "新建任务" });
+  await expect(drawer.locator("#mission-workspace")).toHaveValue("/Users/test/qh-agent");
   await drawer.locator("#mission-goal").fill("做一个 HTML 周报");
   await drawer.getByRole("button", { name: "创建任务" }).click();
 
   await expect(page).toHaveURL(/#\/missions\/m-3$/);
   await expect(page.getByRole("heading", { name: "做一个 HTML 周报" }).first()).toBeVisible();
   await expect(page.getByRole("button", { name: "确认计划" })).toBeEnabled();
+});
+
+test("a blocked mission renders the planning error repair actions", async ({ page }) => {
+  await page.route(
+    (url) => new URL(url).pathname === "/v1/missions/m-blocked",
+    (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          mission_id: "m-blocked",
+          task_id: "m-blocked",
+          id: "m-blocked",
+          state: "BLOCKED",
+          status: "BLOCKED",
+          title: "修复 Agent 配置",
+          goal: "修复 Agent 配置",
+          workspace: "/Users/test/qh-agent",
+          task_spec: {},
+          plan: null,
+          members: [],
+          attempts: [],
+          artifacts: [],
+          reviews: [],
+          messages: [],
+          timeline: [],
+          permissions: [],
+          needs_user_action: true,
+          planning_error: {
+            code: "ACP_PROFILE_UNUSABLE",
+            message: "主 Agent profile 不可用",
+            retryable: true,
+          },
+          fallback_used: false,
+          created_at: "2026-08-01T08:00:00Z",
+          updated_at: "2026-08-01T08:00:05Z",
+        }),
+      }),
+  );
+  await page.goto("/#/missions/m-blocked");
+  const banner = page.getByTestId("mission-planning-error");
+  await expect(banner).toContainText("规划失败：主 Agent profile 不可用");
+  await expect(banner.getByRole("button", { name: "重新规划" })).toBeVisible();
+  await banner.getByRole("button", { name: "去 Agent 设置" }).click();
+  await expect(page).toHaveURL(/#\/agents$/);
 });
 
 // Route-override the profile list for the "fresh install" scenarios (no enabled +

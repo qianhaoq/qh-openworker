@@ -20,7 +20,7 @@ The first launch seeds four editable profiles in `qh_orchestrator.db`:
 | --- | --- | --- | --- |
 | `opencode-main` | main | `opencode acp` | enabled |
 | `opencode-executor` | executor | `opencode acp` | enabled |
-| `opencode-reviewer` | reviewer | `opencode acp` | enabled, permanently read-only |
+| `opencode-reviewer` | reviewer | `opencode acp` | enabled, host-enforced read-only policy |
 | `pi-experimental` | executor | `pi --mode rpc` | disabled experiment |
 
 Profiles and per-workspace main-Agent selection are available in Settings and through
@@ -76,6 +76,10 @@ global, current-workspace, and current-conversation text memories. Raw audio is 
 placed in an Agent context.
 
 ## Security boundaries
+
+ACP read-only is a policy enforced by the OpenWorker host at protocol and orchestration
+boundaries. The configured Agent binary is trusted local code; this policy is not an OS,
+container, or VM sandbox and must not be described as one.
 
 - Agent subprocesses receive a minimal environment. Ambient credentials are excluded;
   only a profile's explicit `secret_refs` may be injected.

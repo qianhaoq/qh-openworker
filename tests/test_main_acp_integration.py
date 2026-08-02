@@ -11,6 +11,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from coworker.acp import AcpMcpServer, AcpSessionHandle, AcpTurnResult
 from coworker.server import SessionManager, create_app
+from coworker.sessions import SessionRecord
 
 
 class FakeMainAdapter:
@@ -198,6 +199,80 @@ def test_acp_websocket_turn_maps_events_and_rejects_concurrent_prompt(tmp_path):
         asyncio.run(manager.aclose())
 
 
+def test_new_embedded_session_without_model_credentials_is_rejected_with_runtime_context(
+    tmp_path, monkeypatch
+):
+    for variable in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"):
+        monkeypatch.delenv(variable, raising=False)
+    manager = SessionManager(data_dir=tmp_path / "data")
+    client = TestClient(create_app(manager))
+
+    try:
+        with client.websocket_connect(
+            "/ws/session/new-home?agent=cowork&runtime=embedded"
+        ) as ws:
+            event = ws.receive_json()
+            assert event == {
+                "type": "error",
+                "data": {
+                    "code": "MODEL_NOT_READY",
+                    "error": "Configure the current model before starting an embedded session.",
+                    "runtime": "embedded",
+                    "model": manager.model,
+                },
+            }
+            with pytest.raises(WebSocketDisconnect):
+                ws.receive_json()
+    finally:
+        asyncio.run(manager.aclose())
+
+
+def test_existing_embedded_session_keeps_its_runtime_without_rechecking_model_key(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manager = SessionManager(data_dir=tmp_path / "data")
+    manager.session_store.save(
+        SessionRecord(
+            session_id="existing-home",
+            workspace=str(workspace),
+            model="gpt-5.5",
+            mode="interactive",
+            agent="cowork",
+            messages=[{"role": "user", "content": "existing"}],
+        )
+    )
+    client = TestClient(create_app(manager))
+
+    try:
+        with client.websocket_connect(
+            f"/ws/session/existing-home?agent=cowork&runtime=embedded&workspace={workspace}"
+        ) as ws:
+            ready = ws.receive_json()
+            assert ready["type"] == "ready"
+            assert ready["data"]["model"] == "gpt-5.5"
+    finally:
+        asyncio.run(manager.aclose())
+
+
+def test_new_coding_session_cannot_select_embedded_runtime(tmp_path):
+    manager = SessionManager(data_dir=tmp_path / "data")
+    client = TestClient(create_app(manager))
+
+    try:
+        with client.websocket_connect(
+            "/ws/session/new-code?agent=code&runtime=embedded"
+        ) as ws:
+            event = ws.receive_json()
+            assert event["data"]["code"] == "ACP_RUNTIME_REQUIRED"
+            assert event["data"]["runtime"] == "embedded"
+            assert event["data"]["model"] == manager.model
+    finally:
+        asyncio.run(manager.aclose())
+
+
 def test_deliver_to_session_routes_existing_code_acp_conversation_to_host(tmp_path, monkeypatch):
     adapter = FakeMainAdapter()
     manager = _manager(tmp_path, adapter)
@@ -348,6 +423,15 @@ def test_audio_transcript_memory_endpoint_accepts_text_and_rejects_audio_payload
 def test_acp_websocket_passes_profile_id_to_main_host(tmp_path, monkeypatch):
     adapter = FakeMainAdapter()
     manager = _manager(tmp_path, adapter)
+    _register_profile(
+        manager,
+        {
+            "id": "exec-chat",
+            "role": "executor",
+            "transport": "acp_stdio",
+            "command": "fake",
+        },
+    )
     client = TestClient(create_app(manager))
     opened: list[dict[str, Any]] = []
 
@@ -410,10 +494,6 @@ def test_acp_websocket_invalid_profile_id_sends_error_event_and_closes(
     manager = _manager(tmp_path, adapter)
     client = TestClient(create_app(manager))
 
-    async def fake_open(conversation_id, workspace, profile_id=None):
-        raise ValueError(f"未找到 Agent 配置：{profile_id}")
-
-    monkeypatch.setattr(manager.main_acp_host, "open", fake_open)
     try:
         with client.websocket_connect(
             f"/ws/session/acp-bad?agent=code&runtime=acp&workspace={tmp_path}"
@@ -421,7 +501,10 @@ def test_acp_websocket_invalid_profile_id_sends_error_event_and_closes(
         ) as ws:
             event = ws.receive_json()
             assert event["type"] == "error"
-            assert event["data"]["error"] == "未找到 Agent 配置：nope"
+            assert event["data"]["code"] == "ACP_PROFILE_UNUSABLE"
+            assert event["data"]["runtime"] == "acp"
+            assert event["data"]["model"] == "nope"
+            assert event["data"]["error"] == "Agent profile not found: nope"
             with pytest.raises(WebSocketDisconnect):
                 ws.receive_json()
     finally:

@@ -1636,8 +1636,18 @@ def create_app(
 
     @app.post("/v1/missions")
     async def missions_create(body: dict) -> dict[str, Any]:
+        payload = body or {}
+        spec = payload.get("task_spec") if isinstance(payload.get("task_spec"), dict) else {}
+        if not (payload.get("workspace") or spec.get("workspace")):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "MISSION_WORKSPACE_REQUIRED",
+                    "message": "Mission creation requires a workspace.",
+                },
+            )
         try:
-            return await manager.create_mission_with_main_planning(body or {})
+            return await manager.create_mission_with_main_planning(payload)
         except (KeyError, ValueError, OrchestrationStoreError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1889,8 +1899,37 @@ def create_app(
             return
         await ws.accept(subprotocol="openworker" if api_token else None)
         agent = ws.query_params.get("agent") or "code"
-        if ws.query_params.get("runtime") == "acp":
-            await _ws_main_acp(ws, session_id, agent)
+        runtime = "acp" if ws.query_params.get("runtime") == "acp" else "embedded"
+        profile_id = (ws.query_params.get("profile_id") or "").strip() or None
+        runtime_gate = manager.validate_session_runtime(
+            session_id,
+            runtime=runtime,
+            agent=agent,
+            workspace=ws.query_params.get("workspace"),
+            profile_id=profile_id,
+        )
+        if not runtime_gate.get("ok"):
+            await ws.send_json(
+                {
+                    "type": "error",
+                    "data": {
+                        "code": runtime_gate.get("code"),
+                        "error": runtime_gate.get("error"),
+                        "runtime": runtime_gate.get("runtime"),
+                        "model": runtime_gate.get("model"),
+                    },
+                }
+            )
+            await ws.close(code=1008)
+            return
+        if runtime == "acp":
+            await _ws_main_acp(
+                ws,
+                session_id,
+                agent,
+                workspace=runtime_gate.get("workspace"),
+                profile_id=profile_id,
+            )
             return
 
         # All four interactive prompts (approval / question / directory / plan) are parked as Inbox
@@ -2336,8 +2375,15 @@ def create_app(
         finally:
             manager.unregister_session_client(session_id, ws.send_json)
 
-    async def _ws_main_acp(ws: WebSocket, session_id: str, agent: str) -> None:
-        workspace = manager.resolve_workspace(ws.query_params.get("workspace"))
+    async def _ws_main_acp(
+        ws: WebSocket,
+        session_id: str,
+        agent: str,
+        *,
+        workspace: Optional[str] = None,
+        profile_id: Optional[str] = None,
+    ) -> None:
+        workspace = workspace or manager.resolve_workspace(ws.query_params.get("workspace"))
         if not workspace:
             await ws.send_json(
                 {
@@ -2351,12 +2397,21 @@ def create_app(
             return
 
         try:
-            profile_id = (ws.query_params.get("profile_id") or "").strip() or None
             handle = await manager.main_acp_host.open(
                 session_id, workspace, profile_id=profile_id
             )
         except Exception as exc:
-            await ws.send_json({"type": "error", "data": {"error": str(exc)}})
+            await ws.send_json(
+                {
+                    "type": "error",
+                    "data": {
+                        "code": "ACP_RUNTIME_ERROR",
+                        "error": str(exc),
+                        "runtime": "acp",
+                        "model": profile_id or "workspace-main",
+                    },
+                }
+            )
             await ws.close()
             return
 

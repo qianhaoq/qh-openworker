@@ -53,6 +53,85 @@ test("the new-session idle state sends a suggestion", async ({ page }) => {
   await expect(page.getByText(/Echo: 帮我写个周报草稿/)).toBeVisible();
 });
 
+test("a new embedded session with no model key does not open a session socket", async ({
+  page,
+}) => {
+  await page.route(
+    (url) => new URL(url).pathname === "/v1/settings",
+    (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          provider: "openai",
+          model: "gpt-5.5",
+          models: ["gpt-5.5"],
+          has_key: false,
+          model_ready: false,
+          source: null,
+          credential_source: null,
+          onboarded: true,
+          surfaces: { cowork: true, chat: false, code: true },
+          scratch_base: "~/OpenWorker",
+          secrets_path: "/tmp/secrets.json",
+        }),
+      }),
+  );
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "新会话" }).last().click();
+  await expect(page.getByTestId("new-session-runtime-gate")).toContainText("配置模型");
+  await page.waitForTimeout(300);
+  expect(sessionSocketUrls(page).filter((url) => url.includes("/ws/session/"))).toHaveLength(0);
+
+  await page.getByRole("button", { name: "qh-agent" }).click();
+  await expect
+    .poll(() => sessionSocketUrls(page).some((url) => url.includes("runtime=acp")))
+    .toBe(true);
+});
+
+test("a new ACP session waits for a usable workspace main profile", async ({ page }) => {
+  await page.route(
+    (url) => new URL(url).pathname === "/v1/settings",
+    (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          provider: "openai",
+          model: "gpt-5.5",
+          models: ["gpt-5.5"],
+          has_key: false,
+          model_ready: false,
+          source: null,
+          credential_source: null,
+          onboarded: true,
+          surfaces: { cowork: true, chat: false, code: true },
+          scratch_base: "~/OpenWorker",
+          secrets_path: "/tmp/secrets.json",
+        }),
+      }),
+  );
+  await page.route(
+    (url) => new URL(url).pathname === "/v1/agent-profiles/main",
+    (route) =>
+      route.fulfill({
+        status: 404,
+        contentType: "application/json",
+        body: JSON.stringify({ detail: "no usable main profile" }),
+      }),
+  );
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "新会话" }).last().click();
+  await page.getByRole("button", { name: "qh-agent" }).click();
+  await expect(page.getByTestId("new-session-runtime-gate")).toContainText(
+    "尚未配置可用的 main ACP Agent",
+  );
+  await page.waitForTimeout(300);
+  expect(sessionSocketUrls(page).filter((url) => url.includes("runtime=acp"))).toHaveLength(0);
+});
+
 test("a tool permission card approves inline and the turn continues", async ({ page }) => {
   await page.goto("/#/assistant/pinned-cowork-1");
   await composer(page).fill("please run a tool");

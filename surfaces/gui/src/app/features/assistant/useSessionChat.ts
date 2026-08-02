@@ -66,6 +66,7 @@ export interface UseSessionChatOptions {
   /** Header picker selection: "embedded" | "acp" (workspace main) | an agent profile id.
    * Changing it reconnects the socket with the new runtime/profile binding. */
   agentChoice: AgentChoice;
+  connect?: boolean;
   /** turn_done settled — the session list / artifacts are now stale. */
   onTurnSettled?: () => void;
 }
@@ -89,6 +90,7 @@ export function useSessionChat({
   workspace,
   agent,
   agentChoice,
+  connect = true,
   onTurnSettled,
 }: UseSessionChatOptions): SessionChat {
   const [state, setState] = useState<ChatState>(initialChatState);
@@ -139,6 +141,12 @@ export function useSessionChat({
   const workspaceRef = useRef(workspace);
   workspaceRef.current = workspace;
   useEffect(() => {
+    if (!connect) {
+      socketRef.current?.close();
+      socketRef.current = null;
+      setState((s) => markConnected(s, false));
+      return;
+    }
     const { runtime, profileId } = resolveAgentChoice(agentChoice);
     const socket = new SessionSocket(sessionId, workspaceRef.current, agent, {
       onEvent: (event) => {
@@ -154,7 +162,7 @@ export function useSessionChat({
       socket.close();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, agent, agentChoice]);
+  }, [sessionId, agent, agentChoice, connect]);
 
   const setUnattended = useCallback(
     (on: boolean) => setState((s) => markUnattended(s, on)),

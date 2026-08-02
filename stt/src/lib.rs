@@ -52,9 +52,12 @@ pub struct DownloadProgress {
 
 struct Recording {
     stream: Stream,
-    samples: Arc<Mutex<Vec<f32>>>,
+    samples: SampleBuffer,
     sample_rate: u32,
 }
+
+type SampleBuffer = Arc<Mutex<Vec<f32>>>;
+type LiveRecording = Arc<Mutex<Option<(SampleBuffer, u32)>>>;
 
 /// A reusable single-microphone dictation session manager.
 ///
@@ -69,7 +72,7 @@ pub struct Dictation {
     recording: Arc<Mutex<bool>>,
     // Live handle onto the in-flight recording's sample buffer (set by the capture worker
     // for the duration of a session) so hosts can meter input loudness for UI feedback.
-    live: Arc<Mutex<Option<(Arc<Mutex<Vec<f32>>>, u32)>>>,
+    live: LiveRecording,
     download_in_progress: AtomicBool,
     cancel_download: AtomicBool,
 }
@@ -403,7 +406,7 @@ fn model_verification_marker_matches(model_path: &Path, marker_path: &Path) -> b
 fn capture_worker(
     receiver: Receiver<Command>,
     recording_status: Arc<Mutex<bool>>,
-    live: Arc<Mutex<Option<(Arc<Mutex<Vec<f32>>>, u32)>>>,
+    live: LiveRecording,
 ) {
     let mut recording: Option<Recording> = None;
     let set_live = |value: Option<(Arc<Mutex<Vec<f32>>>, u32)>| {

@@ -42,11 +42,15 @@ export function useMissions() {
   }, [anyLive, refresh]);
 
   /** POST the goal and hand the created mission back so the page can navigate. */
-  const create = useCallback(async (goal: string): Promise<Mission> => {
+  const create = useCallback(async (goal: string, workspace: string): Promise<Mission> => {
     setCreating(true);
     try {
       const trimmed = goal.trim();
-      const mission = await createMission({ goal: trimmed, title: trimmed.slice(0, 80) });
+      const mission = await createMission({
+        goal: trimmed,
+        title: trimmed.slice(0, 80),
+        workspace: workspace.trim(),
+      });
       setMissions((current) => [
         mission,
         ...current.filter((item) => item.mission_id !== mission.mission_id),

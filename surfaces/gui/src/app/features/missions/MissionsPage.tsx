@@ -5,7 +5,8 @@ import { useEffect, useState, type FormEvent } from "react";
 import { Icon } from "../../components/Icon";
 import { navigate, useRoute } from "../../nav";
 import { listAgentProfiles } from "../../lib/api/agents";
-import type { AgentProfile, Mission } from "../../lib/api/types";
+import { getRecentWorkspaces, openWorkspace, pickFolderViaServer } from "../../lib/api/sessions";
+import type { AgentProfile, Mission, RecentWorkspace } from "../../lib/api/types";
 import { humanizeErrorText } from "../../lib/errorText";
 import { hasUsableExecutor } from "../agents/agentLogic";
 import { MissionDetailPage } from "./MissionDetailPage";
@@ -13,9 +14,11 @@ import {
   MISSION_FILTERS,
   formatTime,
   missionMatchesFilter,
+  missionPlanningErrorText,
   missionTitle,
   sortMissionsByUpdated,
   stateMeta,
+  validateMissionWorkspace,
   type MissionFilter,
 } from "./missionLogic";
 import { useMissions } from "./useMissions";
@@ -51,8 +54,15 @@ function MissionRow({ mission, onOpen }: { mission: Mission; onOpen: () => void 
       <span className="min-w-0 flex-1">
         <span className="block truncate text-[13px] font-medium">{missionTitle(mission)}</span>
         <span className="mt-0.5 block text-[11.5px] text-faint">
-          {mission.members.length} 个席位 · 更新于 {formatTime(mission.updated_at ?? mission.created_at)}
+          {mission.members.length} 个席位
+          {mission.workspace ? ` · ${mission.workspace}` : ""} · 更新于{" "}
+          {formatTime(mission.updated_at ?? mission.created_at)}
         </span>
+        {missionPlanningErrorText(mission) && (
+          <span className="mt-1 block truncate text-[11.5px] text-danger">
+            {missionPlanningErrorText(mission)}
+          </span>
+        )}
       </span>
       <Icon name="chevronRight" size={14} className="shrink-0 text-faint" />
     </div>
@@ -66,9 +76,11 @@ function CreateMissionDrawer({
 }: {
   creating: boolean;
   onClose: () => void;
-  onCreate: (goal: string) => Promise<string | null>;
+  onCreate: (goal: string, workspace: string) => Promise<string | null>;
 }) {
   const [goal, setGoal] = useState("");
+  const [workspace, setWorkspace] = useState("");
+  const [recentWorkspaces, setRecentWorkspaces] = useState<RecentWorkspace[]>([]);
   const [error, setError] = useState<string | null>(null);
   // Pre-check: creating needs an enabled + probed executor profile (the backend 400s
   // with a cryptic message otherwise). null = still loading / load failed — don't gate.
@@ -84,15 +96,42 @@ function CreateMissionDrawer({
     };
   }, []);
 
+  useEffect(() => {
+    let stale = false;
+    getRecentWorkspaces()
+      .then((list) => {
+        if (stale) return;
+        setRecentWorkspaces(list);
+        const first = list.find((item) => item.exists !== false)?.path ?? "";
+        if (first) setWorkspace((current) => current || first);
+      })
+      .catch(() => {});
+    return () => {
+      stale = true;
+    };
+  }, []);
+
   const executorMissing = profiles !== null && !hasUsableExecutor(profiles);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
+    const invalidWorkspace = validateMissionWorkspace(workspace);
+    if (invalidWorkspace) {
+      setError(invalidWorkspace);
+      return;
+    }
     if (!goal.trim() || creating || executorMissing) return;
     setError(null);
-    const failure = await onCreate(goal);
+    const failure = await onCreate(goal, workspace);
     // The raw 400 can still slip through (profile flipped between load and submit).
     if (failure) setError(humanizeErrorText(failure));
+  };
+
+  const browseWorkspace = async () => {
+    const picked = await pickFolderViaServer();
+    if (!picked) return;
+    const opened = await openWorkspace(picked).catch(() => null);
+    setWorkspace(opened?.ok && opened.path ? opened.path : picked);
   };
 
   return (
@@ -130,6 +169,35 @@ function CreateMissionDrawer({
             autoFocus
             className="w-full resize-none rounded-lg border border-line bg-panel px-3 py-2 text-[13px] leading-relaxed outline-none placeholder:text-faint focus:border-lineStrong"
           />
+          <label htmlFor="mission-workspace" className="mb-1.5 mt-4 text-[12px] font-semibold text-muted">
+            Workspace
+          </label>
+          <div className="flex items-center gap-2">
+            <select
+              id="mission-workspace"
+              value={workspace}
+              onChange={(event) => setWorkspace(event.target.value)}
+              className="min-w-0 flex-1 rounded-lg border border-line bg-panel px-3 py-2 text-[13px] outline-none focus:border-lineStrong"
+            >
+              <option value="">选择 workspace</option>
+              {recentWorkspaces.map((item) => (
+                <option key={item.path} value={item.path}>
+                  {item.name || item.path}
+                </option>
+              ))}
+              {workspace && !recentWorkspaces.some((item) => item.path === workspace) && (
+                <option value={workspace}>{workspace}</option>
+              )}
+            </select>
+            <button
+              type="button"
+              onClick={() => void browseWorkspace()}
+              className="flex shrink-0 items-center gap-1.5 rounded-lg border border-line bg-panel px-3 py-2 text-[12.5px] hover:border-lineStrong"
+            >
+              <Icon name="folder" size={14} />
+              选择
+            </button>
+          </div>
           {error && (
             <p className="mt-2 text-[12px] text-danger" role="alert">
               {error}
@@ -161,7 +229,7 @@ function CreateMissionDrawer({
             </button>
             <button
               type="submit"
-              disabled={!goal.trim() || creating || executorMissing}
+              disabled={!goal.trim() || !workspace.trim() || creating || executorMissing}
               title={executorMissing ? "需要先在 Agents 页启用一个「执行」角色的 agent" : undefined}
               className="flex items-center gap-1.5 rounded-lg bg-accent px-3.5 py-1.5 text-[12.5px] font-medium text-white hover:brightness-105 disabled:opacity-40"
             >
@@ -182,9 +250,9 @@ function MissionListPage() {
 
   const filtered = sortMissionsByUpdated(missions.filter((mission) => missionMatchesFilter(mission, filter)));
 
-  const createAndOpen = async (goal: string): Promise<string | null> => {
+  const createAndOpen = async (goal: string, workspace: string): Promise<string | null> => {
     try {
-      const mission = await create(goal);
+      const mission = await create(goal, workspace);
       navigate(`missions/${encodeURIComponent(mission.mission_id)}`);
       return null;
     } catch (error) {

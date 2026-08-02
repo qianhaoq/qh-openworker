@@ -140,6 +140,25 @@ export interface ProviderStatus {
   tone: "ok" | "faint";
 }
 
+export type CredentialSource = "env" | "store" | "mixed" | null;
+
+export function credentialSource(provider: ProviderInfo): CredentialSource {
+  return provider.credential_source ?? provider.source ?? null;
+}
+
+export function credentialSourceLabel(source: CredentialSource): string | null {
+  switch (source) {
+    case "env":
+      return "环境变量";
+    case "store":
+      return "本地密钥库";
+    case "mixed":
+      return "混合来源";
+    default:
+      return null;
+  }
+}
+
 export const providerStatus = (provider: ProviderInfo): ProviderStatus => {
   if (provider.configured && provider.needs_key) return { label: "已配置", tone: "ok" };
   if (!provider.needs_key) return { label: "无需密钥", tone: "faint" };

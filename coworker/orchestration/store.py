@@ -63,6 +63,10 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
 
 
+def _canonical_workspace(workspace: str | Path) -> str:
+    return str(Path(workspace).expanduser().resolve())
+
+
 class OrchestrationStore:
     """Durable control-plane store for qh-openworker agent orchestration."""
 
@@ -347,16 +351,41 @@ class OrchestrationStore:
             VALUES (?, ?)
             ON CONFLICT(workspace) DO UPDATE SET main_profile_id=excluded.main_profile_id
             """,
-            (str(Path(workspace).expanduser()), profile_id),
+            (_canonical_workspace(workspace), profile_id),
         )
         self._db.commit()
 
     @_locked_method
     def get_workspace_main_profile(self, workspace: str | Path) -> Optional[AgentProfile]:
+        canonical = _canonical_workspace(workspace)
         row = self._db.execute(
             "SELECT main_profile_id FROM workspace_agent_profiles WHERE workspace = ?",
-            (str(Path(workspace).expanduser()),),
+            (canonical,),
         ).fetchone()
+        if row is None:
+            # Upgrade legacy aliases (notably macOS /tmp -> /private/tmp) lazily.
+            # This only scans on a miss; an existing canonical binding always wins.
+            aliases = self._db.execute(
+                "SELECT workspace, main_profile_id FROM workspace_agent_profiles"
+            ).fetchall()
+            row = next(
+                (
+                    candidate
+                    for candidate in aliases
+                    if _canonical_workspace(candidate["workspace"]) == canonical
+                ),
+                None,
+            )
+            if row is not None:
+                self._db.execute(
+                    """
+                    INSERT INTO workspace_agent_profiles(workspace, main_profile_id)
+                    VALUES (?, ?)
+                    ON CONFLICT(workspace) DO UPDATE SET main_profile_id=excluded.main_profile_id
+                    """,
+                    (canonical, row["main_profile_id"]),
+                )
+                self._db.commit()
         return self.get_profile(row["main_profile_id"]) if row else None
 
     # -- sessions -----------------------------------------------------------

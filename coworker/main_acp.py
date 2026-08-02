@@ -463,15 +463,17 @@ class MainAcpHost:
                 raise ValueError(
                     f"workspace main profile must have role=main: {profile.id}"
                 )
-            return profile
-        profile = self.orchestrator.get(clean_profile_id)
-        if profile is None:
-            raise ValueError(f"未找到 Agent 配置：{clean_profile_id}")
+        else:
+            profile = self.orchestrator.get(clean_profile_id)
+            if profile is None:
+                raise ValueError(f"未找到 Agent 配置：{clean_profile_id}")
         if not profile.enabled:
-            raise ValueError(f"Agent 配置未启用：{clean_profile_id}")
+            raise ValueError(f"Agent 配置未启用：{profile.id}")
+        if profile.transport == Transport.EMBEDDED:
+            raise ValueError(f"Agent 配置不是 ACP runtime：{profile.id}")
         if not profile.has_current_capability_probe():
             raise ValueError(
-                f"Agent 配置缺少当前版本的能力探测，请重新探测后再试：{clean_profile_id}"
+                f"Agent 配置缺少当前版本的能力探测，请重新探测后再试：{profile.id}"
             )
         return profile
 

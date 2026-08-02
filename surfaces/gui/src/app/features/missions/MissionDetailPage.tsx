@@ -3,11 +3,12 @@
 
 import { useState, type FormEvent } from "react";
 import { Icon } from "../../components/Icon";
+import { createMission } from "../../lib/api/missions";
 import { navigate } from "../../nav";
 import { PlanCard } from "./PlanCard";
 import { ArtifactsDrawer, ReviewsDrawer, TeamPanel } from "./TeamPanel";
 import { Timeline } from "./Timeline";
-import { formatTime, missionTitle, stateMeta } from "./missionLogic";
+import { formatTime, missionPlanningErrorText, missionTitle, stateMeta } from "./missionLogic";
 import { useMissionDetail } from "./useMissionDetail";
 
 type SideDrawer = { kind: "artifacts"; attemptId: string | null } | { kind: "reviews" } | null;
@@ -124,6 +125,8 @@ export function MissionDetailPage({ missionId }: { missionId: string }) {
     cancel,
   } = useMissionDetail(missionId);
   const [drawer, setDrawer] = useState<SideDrawer>(null);
+  const [planningRetrying, setPlanningRetrying] = useState(false);
+  const [planningRetryError, setPlanningRetryError] = useState<string | null>(null);
 
   if (loading) {
     return (
@@ -159,6 +162,26 @@ export function MissionDetailPage({ missionId }: { missionId: string }) {
 
   const meta = stateMeta(mission.state);
   const cancellable = !["DONE", "APPROVED", "CANCELLED"].includes(mission.state);
+  const planningError = missionPlanningErrorText(mission);
+  const retryPlanning = async () => {
+    const workspace = mission.workspace?.trim();
+    const goal = mission.goal?.trim();
+    if (!workspace || !goal || planningRetrying) return;
+    setPlanningRetrying(true);
+    setPlanningRetryError(null);
+    try {
+      const replacement = await createMission({
+        goal,
+        title: missionTitle(mission),
+        workspace,
+      });
+      navigate(`missions/${encodeURIComponent(replacement.mission_id)}`);
+    } catch (error) {
+      setPlanningRetryError(error instanceof Error ? error.message : "重新规划失败");
+    } finally {
+      setPlanningRetrying(false);
+    }
+  };
 
   return (
     <div data-tauri-drag-region className="mx-auto max-w-6xl px-8 py-8">
@@ -197,6 +220,38 @@ export function MissionDetailPage({ missionId }: { missionId: string }) {
           </div>
         )}
       </header>
+
+      {(planningError || mission.state === "BLOCKED") && (
+        <div
+          role="alert"
+          data-testid="mission-planning-error"
+          className="mt-4 rounded-xl bg-dangerSoft px-4 py-3 text-[12.5px] leading-relaxed text-danger"
+        >
+          <div className="font-semibold">{planningError || "任务已阻塞"}</div>
+          <div className="mt-1 text-danger/80">
+            检查 workspace、主 Agent profile、认证与运行时配置后再重试。
+            {mission.fallback_used && " 本次使用了 fallback proposal。"}
+          </div>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => navigate("agents")}
+              className="rounded-lg border border-danger/30 bg-panel px-3 py-1.5 text-[12px] font-medium hover:border-danger/50"
+            >
+              去 Agent 设置
+            </button>
+            <button
+              type="button"
+              disabled={!mission.workspace || !mission.goal || planningRetrying}
+              onClick={() => void retryPlanning()}
+              className="rounded-lg border border-danger/30 bg-panel px-3 py-1.5 text-[12px] font-medium hover:border-danger/50"
+            >
+              {planningRetrying ? "重新规划中…" : "重新规划"}
+            </button>
+          </div>
+          {planningRetryError && <div className="mt-2 text-[12px]">{planningRetryError}</div>}
+        </div>
+      )}
 
       {actionError && (
         <div

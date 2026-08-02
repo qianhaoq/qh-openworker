@@ -1,6 +1,6 @@
 // 模型:默认模型下拉、模型列表增删、提供商列表 + 右侧抽屉配置(字段按 ProviderField
-// 渲染:choices → 分段选择,secret → 密码框;show_when 决定可见性)。验证走
-// /v1/providers/verify,保存走 POST /v1/providers —— 「验证并保存」先验后存。
+// 渲染:choices → 分段选择,secret → 密码框;show_when 决定可见性)。保存走
+// POST /v1/providers；验证是独立的 /v1/providers/verify 只读动作。
 
 import { useEffect, useState } from "react";
 import {
@@ -31,6 +31,8 @@ import {
   apiErrorMessage,
   canRemoveModel,
   canSubmitProvider,
+  credentialSource,
+  credentialSourceLabel,
   defaultModelOptions,
   fieldKind,
   formatContextWindow,
@@ -69,17 +71,13 @@ function ProviderEditor({
   };
 
   const status = providerStatus(provider);
+  const sourceLabel = credentialSourceLabel(credentialSource(provider));
   const keyHelp = KEY_HELP[provider.name];
-  const submitLabel = provider.needs_key ? "验证并保存" : "检测并保存";
+  const submitLabel = "保存";
 
   const submit = async () => {
     setVerify({ state: "testing" });
     try {
-      const checked = await verifyProvider(provider.name, draft);
-      if (!checked.ok) {
-        setVerify({ state: "error", msg: checked.error || "验证失败" });
-        return;
-      }
       const saved = await setProvider(provider.name, draft);
       if (!saved.ok) {
         setVerify({ state: "error", msg: saved.error || "保存失败" });
@@ -88,13 +86,27 @@ function ProviderEditor({
       setVerify({
         state: "ok",
         msg: saved.recommended_model
-          ? `已验证并保存 · 推荐模型 ${saved.recommended_model}`
-          : "已验证并保存",
+          ? `已保存 · 推荐模型 ${saved.recommended_model}`
+          : "已保存",
       });
       setDirty(false);
       onChanged();
     } catch (err) {
       setVerify({ state: "error", msg: apiErrorMessage(err) });
+    }
+  };
+
+  const verifyOnly = async () => {
+    setVerify({ state: "testing" });
+    try {
+      const checked = await verifyProvider(provider.name, draft);
+      setVerify(
+        checked.ok
+          ? { state: "ok", msg: "验证通过" }
+          : { state: "error", msg: checked.error || "验证失败" },
+      );
+    } catch (err) {
+      setVerify({ state: "error", msg: apiErrorMessage(err, "验证失败") });
     }
   };
 
@@ -205,6 +217,9 @@ function ProviderEditor({
             <span className={`${TAG} ${status.tone === "ok" ? "bg-okSoft text-ok" : "bg-solid text-muted"}`}>
               {status.label}
             </span>
+            {sourceLabel && (
+              <span className={`${TAG} bg-accentSoft text-accent`}>{sourceLabel}</span>
+            )}
           </div>
           <button
             type="button"
@@ -266,16 +281,26 @@ function ProviderEditor({
               </button>
             )
           ) : (
-            <span className="text-[11.5px] text-faint">先运行一次只读验证,通过后保存。</span>
+            <span className="text-[11.5px] text-faint">可先保存配置,再执行只读验证。</span>
           )}
-          <button
-            type="button"
-            className={BTN_ACCENT + " shrink-0"}
-            disabled={verify.state === "testing" || !canSubmitProvider(provider, draft)}
-            onClick={() => void submit()}
-          >
-            {verify.state === "testing" ? "验证中…" : submitLabel}
-          </button>
+          <div className="flex shrink-0 items-center gap-2">
+            <button
+              type="button"
+              className={BTN + " px-3 py-1.5"}
+              disabled={verify.state === "testing" || !canSubmitProvider(provider, draft)}
+              onClick={() => void verifyOnly()}
+            >
+              验证
+            </button>
+            <button
+              type="button"
+              className={BTN_ACCENT}
+              disabled={verify.state === "testing" || !canSubmitProvider(provider, draft)}
+              onClick={() => void submit()}
+            >
+              {verify.state === "testing" ? "处理中…" : submitLabel}
+            </button>
+          </div>
         </div>
       </aside>
     </>
@@ -484,6 +509,7 @@ export function ModelsSection() {
         <div className={GRP + " divide-y divide-line"}>
           {providers.map((provider) => {
             const status = providerStatus(provider);
+            const sourceLabel = credentialSourceLabel(credentialSource(provider));
             const used = relTime(provider.last_used_at);
             return (
               <div
@@ -513,13 +539,18 @@ export function ModelsSection() {
                 >
                   {status.label}
                 </span>
+                {sourceLabel && (
+                  <span className={`${TAG} shrink-0 bg-accentSoft text-accent`}>
+                    {sourceLabel}
+                  </span>
+                )}
                 <Icon name="chevronRight" size={14} className="shrink-0 text-faint" />
               </div>
             );
           })}
         </div>
       )}
-      <p className={GRP_NOTE}>点击提供商配置密钥或接入方式;「验证并保存」会先做一次只读检查。</p>
+      <p className={GRP_NOTE}>点击提供商配置密钥或接入方式；保存可离线完成，验证是独立只读检查。</p>
 
       {selectedProvider && (
         <ProviderEditor

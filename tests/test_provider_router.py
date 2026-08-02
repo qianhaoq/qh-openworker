@@ -3,6 +3,7 @@ strip + caching, Ollama capabilities, and manager get/set_provider. SDK-free."""
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 from coworker.providers import (
@@ -449,6 +450,99 @@ def test_anthropic_gemini_provider_config(tmp_path, monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "AIza-env")
     provs = {p["name"]: p for p in mgr.get_providers()}
     assert provs["gemini"]["configured"] is True
+
+
+def test_env_only_provider_save_never_copies_process_secret(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-env-must-stay-out-of-store")
+    from coworker.server.manager import SessionManager
+
+    mgr = SessionManager(data_dir=tmp_path / "data")
+    saved = mgr.set_provider(
+        "openai", {"base_url": "https://gateway.example.test/v1"}
+    )
+
+    assert saved["ok"] is True
+    raw = mgr.secrets.get_raw("provider:openai") or {}
+    assert raw["base_url"] == "https://gateway.example.test/v1"
+    assert "api_key" not in raw
+    assert "sk-env-must-stay-out-of-store" not in mgr.secrets.path.read_text(
+        encoding="utf-8"
+    )
+    provider = {item["name"]: item for item in mgr.get_providers()}["openai"]
+    assert provider["configured"] is True
+    assert provider["credential_source"] == "env"
+    settings = mgr.get_settings()
+    assert settings["has_key"] is True
+    assert settings["credential_source"] == "env"
+    asyncio.run(mgr.aclose())
+
+
+def test_provider_credential_source_reports_store_and_mixed(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    from coworker.server.manager import SessionManager
+
+    mgr = SessionManager(data_dir=tmp_path / "data")
+    assert mgr.set_provider("anthropic", {"api_key": "store-only"})["ok"] is True
+    provider = {item["name"]: item for item in mgr.get_providers()}["anthropic"]
+    assert provider["credential_source"] == "store"
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "env-too")
+    provider = {item["name"]: item for item in mgr.get_providers()}["anthropic"]
+    assert provider["credential_source"] == "mixed"
+    mgr.set_default_model("anthropic:claude-sonnet-4-6")
+    settings = mgr.get_settings()
+    assert settings["provider"] == "anthropic"
+    assert settings["has_key"] is True
+    assert settings["credential_source"] == "mixed"
+    asyncio.run(mgr.aclose())
+
+
+def test_resaving_env_reference_does_not_materialize_its_value(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-resolved-value")
+    from coworker.server.manager import SessionManager
+
+    mgr = SessionManager(data_dir=tmp_path / "data")
+    mgr.secrets.put("provider:openai", {"api_key": "${OPENAI_API_KEY}"})
+    assert mgr.set_provider("openai", {"base_url": "https://api.example.test/v1"})[
+        "ok"
+    ] is True
+
+    raw = mgr.secrets.get_raw("provider:openai") or {}
+    assert raw["api_key"] == "${OPENAI_API_KEY}"
+    assert "sk-resolved-value" not in mgr.secrets.path.read_text(encoding="utf-8")
+    assert mgr.get_settings()["credential_source"] == "env"
+    asyncio.run(mgr.aclose())
+
+
+def test_unresolved_env_reference_does_not_make_embedded_model_ready(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    from coworker.server.manager import SessionManager
+
+    mgr = SessionManager(data_dir=tmp_path / "data")
+    mgr.secrets.put("provider:openai", {"api_key": "${OPENAI_API_KEY}"})
+
+    provider = {item["name"]: item for item in mgr.get_providers()}["openai"]
+    assert provider["configured"] is False
+    assert provider["credential_source"] is None
+    settings = mgr.get_settings()
+    assert settings["has_key"] is False
+    assert settings["model_ready"] is False
+    assert settings["credential_source"] is None
+    gate = mgr.validate_session_runtime(
+        "new-home",
+        runtime="embedded",
+        agent="cowork",
+        workspace=None,
+    )
+    assert gate["ok"] is False
+    assert gate["code"] == "MODEL_NOT_READY"
+    asyncio.run(mgr.aclose())
 
 
 def test_first_configured_provider_wins_default(tmp_path, monkeypatch):

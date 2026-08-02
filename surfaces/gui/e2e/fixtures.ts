@@ -405,6 +405,8 @@ function makeMission(id: string, title: string, state: string) {
     ],
     permissions: [] as any[],
     needs_user_action: state === "AWAITING_CONFIRMATION" || state === "BLOCKED",
+    planning_error: null,
+    fallback_used: false,
     last_cursor: `${id}-ev-2`,
     created_at: "2026-08-01T08:00:00Z",
     updated_at: "2026-08-01T08:00:05Z",
@@ -1034,9 +1036,13 @@ export async function mockApi(page: import("@playwright/test").Page) {
         const b = req.postDataJSON() || {};
         const goal = String(b.goal ?? b.task_spec?.prompt ?? "").trim();
         if (!goal) return json({ ok: false, error: "missing goal" });
+        if (!String(b.workspace ?? "").trim()) {
+          return json({ detail: "workspace is required" }, 422);
+        }
         const id = `m-${missions.length + 1}`;
         const mission = makeMission(id, String(b.title || goal).slice(0, 80) || goal, "AWAITING_CONFIRMATION");
         mission.goal = goal;
+        mission.workspace = String(b.workspace);
         mission.plan.goal = goal;
         missions.unshift(mission);
         return json(mission);
@@ -1172,7 +1178,14 @@ export async function mockApi(page: import("@playwright/test").Page) {
       const match = /%%pages=(\d+)/.exec(atob(data.split(",")[1] || "") || "");
       return json({ ok: true, pages: match ? Number(match[1]) : 1, bytes: data.length });
     }
-    if (p.endsWith("/v1/workspaces/recent")) return json({ workspaces: [] });
+    if (p.endsWith("/v1/workspaces/recent")) {
+      return json({
+        workspaces: [
+          { path: "/Users/test/qh-agent", name: "qh-agent", exists: true },
+          { path: "/Users/test/OpenWorker/launch-note", name: "launch-note", exists: true },
+        ],
+      });
+    }
     if (p.endsWith("/v1/workspaces/pick") && m === "POST") {
       return json({ ok: true, path: "/tmp/picked-folder" });
     }

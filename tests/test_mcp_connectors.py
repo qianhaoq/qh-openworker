@@ -10,6 +10,11 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+try:
+    ExceptionGroup
+except NameError:  # Python 3.10 compatibility; builtin on Python 3.11+.
+    from exceptiongroup import ExceptionGroup
+
 from coworker.connectors.setup import (
     connector_list,
     disconnect_connector,

@@ -859,7 +859,7 @@ async function sectionSettings() {
       await secret.fill("AUDIT-FAKE-KEY-123");
       await sleep(300);
     }
-    await dialog.getByRole("button", { name: /验证并保存|检测并保存/ }).click();
+    await dialog.getByRole("button", { name: "验证" }).click();
     await sleep(8000); // verify hits the vendor API
     const err = await dialog.locator('[role="alert"]').evaluateAll((els) => els.map((e) => e.textContent));
     addFinding("info", { text: `verify result: ${JSON.stringify(err).slice(0, 300)}` });
