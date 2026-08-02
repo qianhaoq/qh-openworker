@@ -482,6 +482,19 @@ export interface MissionCreateInput {
   plan?: Partial<MissionPlan>;
 }
 
+// One-shot Mission planning stream (/ws/missions/create). The socket accepts one
+// {type:"create", data:MissionCreateInput} command and never reconnects: Mission state
+// is durable server-side, while the stream only supplies live planning text to the drawer.
+export type MissionPlanningStreamMessage =
+  | { type: "ready"; data: Record<string, never> }
+  | { type: "mission_created"; data: { mission: unknown } }
+  | {
+      type: "planning_delta";
+      data: { text: string; agent_session_id?: string; profile_id?: string | null };
+    }
+  | { type: "mission_complete"; data: { mission: unknown } }
+  | { type: "error"; data: { code?: string; error?: string } };
+
 // Envelope of one frame on the mission events WebSocket (/v1/missions/{id}/events).
 export type MissionStreamMessage =
   | { type: string; event: MissionEvent; cursor: string }

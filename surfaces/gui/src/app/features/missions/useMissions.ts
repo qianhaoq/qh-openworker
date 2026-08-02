@@ -3,7 +3,7 @@
 // (the detail page it navigates to takes over live updates from there).
 
 import { useCallback, useEffect, useState } from "react";
-import { createMission, listMissions } from "../../lib/api/missions";
+import { createMissionStreaming, listMissions } from "../../lib/api/missions";
 import type { Mission } from "../../lib/api/types";
 import { isMissionTerminal } from "./missionLogic";
 
@@ -17,6 +17,7 @@ export function useMissions() {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const [planningOutput, setPlanningOutput] = useState("");
 
   const refresh = useCallback(async () => {
     setMissions(await listMissions());
@@ -44,13 +45,19 @@ export function useMissions() {
   /** POST the goal and hand the created mission back so the page can navigate. */
   const create = useCallback(async (goal: string, workspace: string): Promise<Mission> => {
     setCreating(true);
+    setPlanningOutput("");
     try {
       const trimmed = goal.trim();
-      const mission = await createMission({
-        goal: trimmed,
-        title: trimmed.slice(0, 80),
-        workspace: workspace.trim(),
-      });
+      const mission = await createMissionStreaming(
+        {
+          goal: trimmed,
+          title: trimmed.slice(0, 80),
+          workspace: workspace.trim(),
+        },
+        {
+          onDelta: (text) => setPlanningOutput((current) => current + text),
+        },
+      );
       setMissions((current) => [
         mission,
         ...current.filter((item) => item.mission_id !== mission.mission_id),
@@ -61,5 +68,5 @@ export function useMissions() {
     }
   }, []);
 
-  return { missions, loading, loadError, creating, refresh, create };
+  return { missions, loading, loadError, creating, planningOutput, refresh, create };
 }

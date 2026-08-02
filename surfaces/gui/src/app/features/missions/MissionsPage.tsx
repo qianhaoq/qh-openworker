@@ -71,10 +71,12 @@ function MissionRow({ mission, onOpen }: { mission: Mission; onOpen: () => void 
 
 function CreateMissionDrawer({
   creating,
+  planningOutput,
   onClose,
   onCreate,
 }: {
   creating: boolean;
+  planningOutput: string;
   onClose: () => void;
   onCreate: (goal: string, workspace: string) => Promise<string | null>;
 }) {
@@ -219,6 +221,21 @@ function CreateMissionDrawer({
               </button>
             </div>
           )}
+          {creating && (
+            <div
+              className="mt-3 rounded-lg border border-line bg-panel px-3 py-2.5"
+              data-testid="mission-planning-stream"
+              aria-live="polite"
+            >
+              <div className="flex items-center gap-2 text-[12px] font-medium text-muted">
+                <span className="spinner" />
+                主 Agent 正在规划
+              </div>
+              <pre className="mt-2 max-h-36 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed text-faint">
+                {planningOutput || "正在连接规划会话…"}
+              </pre>
+            </div>
+          )}
           <div className="mt-auto flex justify-end gap-2 pt-4">
             <button
               type="button"
@@ -244,7 +261,7 @@ function CreateMissionDrawer({
 }
 
 function MissionListPage() {
-  const { missions, loading, loadError, creating, refresh, create } = useMissions();
+  const { missions, loading, loadError, creating, planningOutput, refresh, create } = useMissions();
   const [filter, setFilter] = useState<MissionFilter>("all");
   const [composing, setComposing] = useState(false);
 
@@ -350,7 +367,12 @@ function MissionListPage() {
       )}
 
       {composing && (
-        <CreateMissionDrawer creating={creating} onClose={() => setComposing(false)} onCreate={createAndOpen} />
+        <CreateMissionDrawer
+          creating={creating}
+          planningOutput={planningOutput}
+          onClose={() => setComposing(false)}
+          onCreate={createAndOpen}
+        />
       )}
     </div>
   );

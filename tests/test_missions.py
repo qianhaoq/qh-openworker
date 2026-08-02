@@ -351,6 +351,92 @@ def test_mission_rest_websocket_and_profile_delete_contract(tmp_path):
         assert client.delete("/v1/agent-profiles/temporary-explorer").status_code == 404
 
 
+def test_mission_creation_websocket_streams_main_agent_output_before_final_projection(
+    tmp_path,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manager = SessionManager(workspace=workspace, data_dir=tmp_path / "data")
+    manager.start_team_worker = lambda: None  # type: ignore[method-assign]
+
+    plan = {
+        "goal": "Stream the planning output",
+        "members": [
+            {
+                "id": "main:opencode-main",
+                "role": "main",
+                "profile_id": "opencode-main",
+                "objective": "Coordinate",
+            },
+            {
+                "id": "executor:opencode-executor",
+                "role": "executor",
+                "profile_id": "opencode-executor",
+                "objective": "Implement",
+                "depends_on": ["main:opencode-main"],
+            },
+            {
+                "id": "reviewer:opencode-reviewer",
+                "role": "reviewer",
+                "profile_id": "opencode-reviewer",
+                "objective": "Review read-only",
+                "depends_on": ["executor:opencode-executor"],
+            },
+        ],
+        "max_rework_rounds": 2,
+    }
+    serialized = json.dumps(plan)
+    chunks = [serialized[:24], serialized[24:83], serialized[83:]]
+
+    class StreamingPlanningAdapter:
+        async def open_session(self, profile, *, cwd, checkpoint, mcp_servers):
+            return SimpleNamespace(
+                session_id="streaming-planner",
+                capabilities={"streaming": True},
+            )
+
+        async def prompt(self, handle, prompt):
+            for chunk in chunks:
+                await manager._handle_acp_update(  # type: ignore[attr-defined]
+                    {
+                        "type": "acp.session_update",
+                        "profile_id": "opencode-main",
+                        "session_id": handle.session_id,
+                        "text": chunk,
+                    }
+                )
+            return SimpleNamespace(text=serialized)
+
+        async def close(self, handle):
+            return None
+
+    manager.acp_adapter = StreamingPlanningAdapter()  # type: ignore[assignment]
+
+    with TestClient(create_app(manager)) as client:
+        with client.websocket_connect("/ws/missions/create") as socket:
+            assert socket.receive_json()["type"] == "ready"
+            socket.send_json(
+                {
+                    "type": "create",
+                    "data": {
+                        "goal": "Stream the planning output",
+                        "workspace": str(workspace),
+                    },
+                }
+            )
+            frames = []
+            while not frames or frames[-1]["type"] != "mission_complete":
+                frames.append(socket.receive_json())
+
+    types = [frame["type"] for frame in frames]
+    assert types[0] == "mission_created"
+    assert types[1:-1] == ["planning_delta"] * len(chunks)
+    assert "".join(frame["data"]["text"] for frame in frames[1:-1]) == serialized
+    final = frames[-1]["data"]["mission"]
+    assert final["state"] == "AWAITING_CONFIRMATION"
+    assert final["plan_proposal"]["source"] == "main_agent"
+
+
 @pytest.mark.asyncio
 async def test_mission_operational_planning_failure_persists_blocked_without_fallback(
     tmp_path,

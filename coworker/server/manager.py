@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -21,7 +22,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from ..agent import build_engine
 from ..acp import (
@@ -111,6 +112,18 @@ _SCOPES = {s.value for s in Scope}
 
 logger = logging.getLogger("coworker.manager")
 
+MissionPlanningSink = Callable[[dict[str, Any]], Awaitable[None] | None]
+
+
+async def _emit_mission_planning(
+    sink: Optional[MissionPlanningSink], event: dict[str, Any]
+) -> None:
+    if sink is None:
+        return
+    result = sink(event)
+    if inspect.isawaitable(result):
+        await result
+
 
 def _grants_of(engine) -> dict[str, Any]:
     """The engine's session-scoped "Always allow" approvals, in persistable shape."""
@@ -165,6 +178,7 @@ class SessionManager:
             permission_resolver=self._resolve_agent_permission,
         )
         self.pi_adapter = PiJsonlRpcAdapter(update_sink=self._handle_acp_update)
+        self._mission_planning_sinks: dict[str, MissionPlanningSink] = {}
         self.main_acp_host = MainAcpHost(
             orchestrator=self.orchestrator,
             conversations=self.session_store,
@@ -2006,7 +2020,10 @@ class SessionManager:
         )
 
     async def create_mission_with_main_planning(
-        self, payload: dict[str, Any]
+        self,
+        payload: dict[str, Any],
+        *,
+        update_sink: Optional[MissionPlanningSink] = None,
     ) -> dict[str, Any]:
         """Create a Mission and obtain its first structured plan from the main ACP Agent.
 
@@ -2036,21 +2053,37 @@ class SessionManager:
             main_profile_id=main_profile_id,
             defer_plan_proposal=True,
         )
+        await _emit_mission_planning(
+            update_sink,
+            {"type": "mission_created", "data": {"mission": draft}},
+        )
+
+        async def finish(mission: dict[str, Any]) -> dict[str, Any]:
+            await _emit_mission_planning(
+                update_sink,
+                {"type": "mission_complete", "data": {"mission": mission}},
+            )
+            return mission
+
         if str(draft.get("state")) != "PLANNING":
-            return draft
+            return await finish(draft)
         mission_id = str(draft["mission_id"])
         draft_plan = dict(draft.get("plan") or {})
         if profile_error is not None:
-            return self.orchestrator.block_mission_planning(
-                mission_id, self._mission_planning_error(profile_error)
+            return await finish(
+                self.orchestrator.block_mission_planning(
+                    mission_id, self._mission_planning_error(profile_error)
+                )
             )
         assert main_profile is not None
         if planning_mode == "control_plane":
-            return self.orchestrator.propose_mission_plan(
-                mission_id,
-                draft_plan,
-                source="control_plane_fallback",
-                fallback_reason="explicit_control_plane",
+            return await finish(
+                self.orchestrator.propose_mission_plan(
+                    mission_id,
+                    draft_plan,
+                    source="control_plane_fallback",
+                    fallback_reason="explicit_control_plane",
+                )
             )
 
         profiles = [
@@ -2076,6 +2109,7 @@ class SessionManager:
                 conversation_id=str(draft["conversation_id"]),
                 mission_id=mission_id,
                 prompt=planning_prompt,
+                update_sink=update_sink,
             )
         except Exception as exc:
             planning_error = self._mission_planning_error(exc)
@@ -2084,8 +2118,8 @@ class SessionManager:
                 mission_id,
                 planning_error["code"],
             )
-            return self.orchestrator.block_mission_planning(
-                mission_id, planning_error
+            return await finish(
+                self.orchestrator.block_mission_planning(mission_id, planning_error)
             )
 
         try:
@@ -2096,17 +2130,21 @@ class SessionManager:
                 mission_id,
                 type(exc).__name__,
             )
-            return self.orchestrator.propose_mission_plan(
-                mission_id,
-                draft_plan,
-                source="control_plane_fallback",
-                fallback_reason="invalid_main_agent_output",
+            return await finish(
+                self.orchestrator.propose_mission_plan(
+                    mission_id,
+                    draft_plan,
+                    source="control_plane_fallback",
+                    fallback_reason="invalid_main_agent_output",
+                )
             )
-        return self.orchestrator.propose_mission_plan(
-            mission_id,
-            proposed,
-            source="main_agent",
-            agent_session_id=planning_session_id,
+        return await finish(
+            self.orchestrator.propose_mission_plan(
+                mission_id,
+                proposed,
+                source="main_agent",
+                agent_session_id=planning_session_id,
+            )
         )
 
     def _usable_main_profile(self, workspace: str | Path) -> AgentProfile:
@@ -2168,6 +2206,7 @@ class SessionManager:
         conversation_id: str,
         mission_id: str,
         prompt: str,
+        update_sink: Optional[MissionPlanningSink] = None,
     ) -> tuple[Any, str]:
         """Run one isolated, read-only main-Agent planning session.
 
@@ -2208,6 +2247,8 @@ class SessionManager:
             raise ValueError(
                 f"unsupported main planning transport: {planning_profile.transport.value}"
             )
+        if update_sink is not None:
+            self._mission_planning_sinks[handle.session_id] = update_sink
         try:
             self.orchestrator.save_agent_session(
                 session_id=handle.session_id,
@@ -2227,6 +2268,8 @@ class SessionManager:
             result = await adapter.prompt(handle, prompt)
             return result, handle.session_id
         finally:
+            if self._mission_planning_sinks.get(handle.session_id) is update_sink:
+                self._mission_planning_sinks.pop(handle.session_id, None)
             with contextlib.suppress(Exception):
                 await adapter.close(handle)
             with contextlib.suppress(Exception):
@@ -4032,6 +4075,24 @@ class SessionManager:
         logger.debug("acp update: %s", event.get("type"))
         session_id = event.get("session_id")
         if session_id:
+            planning_sink = self._mission_planning_sinks.get(str(session_id))
+            if planning_sink is not None:
+                if event.get("text") is not None and event.get("type") in {
+                    "acp.session_update",
+                    "pi_rpc.message_update",
+                }:
+                    await _emit_mission_planning(
+                        planning_sink,
+                        {
+                            "type": "planning_delta",
+                            "data": {
+                                "text": str(event["text"]),
+                                "agent_session_id": str(session_id),
+                                "profile_id": event.get("profile_id"),
+                            },
+                        },
+                    )
+                return
             for runtime in getattr(self.main_acp_host, "_runtimes", {}).values():
                 handle = getattr(runtime, "handle", None)
                 if getattr(handle, "session_id", None) == session_id:

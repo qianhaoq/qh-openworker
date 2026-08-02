@@ -67,6 +67,9 @@ test("creating a mission navigates to its detail page", async ({ page }) => {
   await drawer.locator("#mission-goal").fill("做一个 HTML 周报");
   await drawer.getByRole("button", { name: "创建任务" }).click();
 
+  const planning = drawer.getByTestId("mission-planning-stream");
+  await expect(planning).toContainText("主 Agent 正在规划");
+  await expect(planning).toContainText('"goal"');
   await expect(page).toHaveURL(/#\/missions\/m-3$/);
   await expect(page.getByRole("heading", { name: "做一个 HTML 周报" }).first()).toBeVisible();
   await expect(page.getByRole("button", { name: "确认计划" })).toBeEnabled();

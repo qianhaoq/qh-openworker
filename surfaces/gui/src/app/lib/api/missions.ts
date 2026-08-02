@@ -1,13 +1,14 @@
 // Missions (structured multi-agent runs) + the team task endpoints they build on.
 // Routes verified against coworker/server/app.py:1472-1634.
 
-import { api } from "./client";
+import { ApiError, api, openWebSocket, wsUrl } from "./client";
 import type {
   MessageTarget,
   Mission,
   MissionCreateInput,
   MissionEventsPage,
   MissionPlan,
+  MissionPlanningStreamMessage,
   MissionState,
   TeamArtifact,
   TeamAttempt,
@@ -61,6 +62,81 @@ function missionFromResponse(value: any): Mission {
 // -- missions (app.py:1472-1548) --------------------------------------------------
 export async function createMission(input: MissionCreateInput): Promise<Mission> {
   return missionFromResponse(await api.post("/v1/missions", input));
+}
+
+export interface MissionPlanningStreamHandlers {
+  onCreated?: (mission: Mission) => void;
+  onDelta?: (text: string) => void;
+}
+
+/** Create one Mission while forwarding the main Agent's text chunks as they arrive.
+ * The existing REST create remains the compatibility path for non-interactive callers. */
+export function createMissionStreaming(
+  input: MissionCreateInput,
+  handlers: MissionPlanningStreamHandlers = {},
+): Promise<Mission> {
+  return new Promise((resolve, reject) => {
+    const socket = openWebSocket(wsUrl("/ws/missions/create"));
+    let settled = false;
+
+    const close = () => {
+      socket.onopen = null;
+      socket.onmessage = null;
+      socket.onerror = null;
+      socket.onclose = null;
+      socket.close();
+    };
+    const fail = (error: ApiError) => {
+      if (settled) return;
+      settled = true;
+      close();
+      reject(error);
+    };
+    const complete = (mission: unknown) => {
+      if (settled) return;
+      settled = true;
+      const normalized = missionFromResponse(mission);
+      close();
+      resolve(normalized);
+    };
+
+    socket.onopen = () => {
+      socket.send(JSON.stringify({ type: "create", data: input }));
+    };
+    socket.onmessage = (message) => {
+      let frame: MissionPlanningStreamMessage;
+      try {
+        frame = JSON.parse(String(message.data)) as MissionPlanningStreamMessage;
+      } catch {
+        fail(new ApiError("Mission planning stream returned invalid JSON", 0, "MISSION_STREAM_PROTOCOL_ERROR"));
+        return;
+      }
+      if (frame.type === "mission_created") {
+        handlers.onCreated?.(missionFromResponse(frame.data.mission));
+      } else if (frame.type === "planning_delta") {
+        if (frame.data.text) handlers.onDelta?.(frame.data.text);
+      } else if (frame.type === "mission_complete") {
+        complete(frame.data.mission);
+      } else if (frame.type === "error") {
+        fail(
+          new ApiError(
+            frame.data.error || "Mission planning failed",
+            0,
+            frame.data.code || "MISSION_CREATE_FAILED",
+            frame,
+          ),
+        );
+      }
+    };
+    socket.onerror = () => {
+      fail(new ApiError("Mission planning stream could not connect", 0, "MISSION_STREAM_NETWORK_ERROR"));
+    };
+    socket.onclose = () => {
+      if (!settled) {
+        fail(new ApiError("Mission planning stream closed before completion", 0, "MISSION_STREAM_CLOSED"));
+      }
+    };
+  });
 }
 
 export async function listMissions(states?: MissionState[]): Promise<Mission[]> {

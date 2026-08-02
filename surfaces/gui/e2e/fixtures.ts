@@ -887,6 +887,56 @@ export async function mockApi(page: import("@playwright/test").Page) {
     });
   });
 
+  // Mission creation is a one-shot planning stream. It preserves the REST create
+  // fixture below for compatibility callers, but the production drawer uses this
+  // socket so users see the main Agent's plan before the final projection is ready.
+  await page.routeWebSocket(/\/ws\/missions\/create$/, (ws) => {
+    const send = (type: string, data: Record<string, unknown> = {}) =>
+      ws.send(JSON.stringify({ type, data }));
+    send("ready");
+    ws.onMessage((raw) => {
+      let frame: any;
+      try {
+        frame = JSON.parse(String(raw));
+      } catch {
+        send("error", { code: "MISSION_CREATE_MESSAGE_INVALID", error: "invalid JSON" });
+        return;
+      }
+      if (frame?.type !== "create" || !frame?.data) {
+        send("error", { code: "MISSION_CREATE_MESSAGE_INVALID", error: "expected create" });
+        return;
+      }
+      const body = frame.data;
+      const goal = String(body.goal ?? body.task_spec?.prompt ?? "").trim();
+      const workspace = String(body.workspace ?? "").trim();
+      if (!goal || !workspace) {
+        send("error", {
+          code: !workspace ? "MISSION_WORKSPACE_REQUIRED" : "MISSION_CREATE_INVALID",
+          error: !workspace ? "workspace is required" : "missing goal",
+        });
+        return;
+      }
+      const id = `m-${missions.length + 1}`;
+      const mission = makeMission(id, String(body.title || goal).slice(0, 80) || goal, "PLANNING");
+      mission.goal = goal;
+      mission.workspace = workspace;
+      mission.plan.goal = goal;
+      send("mission_created", { mission });
+
+      const output = JSON.stringify({ goal, members: mission.members, max_rework_rounds: 2 });
+      const split = Math.max(1, Math.floor(output.length / 2));
+      setTimeout(() => send("planning_delta", { text: output.slice(0, split) }), 60);
+      setTimeout(() => send("planning_delta", { text: output.slice(split) }), 160);
+      setTimeout(() => {
+        mission.state = "AWAITING_CONFIRMATION";
+        mission.status = "AWAITING_CONFIRMATION";
+        mission.needs_user_action = true;
+        missions.unshift(mission);
+        send("mission_complete", { mission });
+      }, 260);
+    });
+  });
+
   // The mission ledger stream (/v1/missions/{id}/events): a quiet socket — no events are
   // pushed (specs drive state changes through the REST mutations, which the page re-reads),
   // and pings get their pong so the keepalive contract holds.

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createMissionStreaming } from "./api/missions";
 import { SessionSocket, connectMissionEvents } from "./ws";
 
 class FakeWebSocket {
@@ -191,5 +192,76 @@ describe("connectMissionEvents", () => {
       "ws://sidecar.test/v1/missions/mission-1/events?after=cursor-9",
     );
     handle.close();
+  });
+});
+
+describe("createMissionStreaming", () => {
+  it("sends one create command, forwards text deltas and resolves the final projection", async () => {
+    vi.stubGlobal("__COWORKER_WS__", "ws://sidecar.test");
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const onDelta = vi.fn();
+    const onCreated = vi.fn();
+
+    const result = createMissionStreaming(
+      { goal: "流式规划", workspace: "/workspace" },
+      { onDelta, onCreated },
+    );
+    const ws = FakeWebSocket.last!;
+    expect(ws.url).toBe("ws://sidecar.test/ws/missions/create");
+
+    ws.readyState = FakeWebSocket.OPEN;
+    ws.onopen?.();
+    expect(JSON.parse(ws.send.mock.calls[0][0])).toEqual({
+      type: "create",
+      data: { goal: "流式规划", workspace: "/workspace" },
+    });
+
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "mission_created",
+        data: { mission: { mission_id: "m-stream", state: "PLANNING" } },
+      }),
+    } as MessageEvent);
+    ws.onmessage?.({
+      data: JSON.stringify({ type: "planning_delta", data: { text: "第一段" } }),
+    } as MessageEvent);
+    ws.onmessage?.({
+      data: JSON.stringify({ type: "planning_delta", data: { text: "第二段" } }),
+    } as MessageEvent);
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "mission_complete",
+        data: { mission: { mission_id: "m-stream", state: "AWAITING_CONFIRMATION" } },
+      }),
+    } as MessageEvent);
+
+    await expect(result).resolves.toEqual(
+      expect.objectContaining({ mission_id: "m-stream", state: "AWAITING_CONFIRMATION" }),
+    );
+    expect(onCreated).toHaveBeenCalledWith(
+      expect.objectContaining({ mission_id: "m-stream", state: "PLANNING" }),
+    );
+    expect(onDelta.mock.calls.map(([text]) => text)).toEqual(["第一段", "第二段"]);
+    expect(ws.close).toHaveBeenCalledOnce();
+  });
+
+  it("rejects a structured server error and closes the one-shot socket", async () => {
+    vi.stubGlobal("__COWORKER_WS__", "ws://sidecar.test");
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+
+    const result = createMissionStreaming({ goal: "失败", workspace: "/workspace" });
+    const ws = FakeWebSocket.last!;
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "error",
+        data: { code: "MISSION_CREATE_INVALID", error: "invalid mission" },
+      }),
+    } as MessageEvent);
+
+    await expect(result).rejects.toMatchObject({
+      message: "invalid mission",
+      code: "MISSION_CREATE_INVALID",
+    });
+    expect(ws.close).toHaveBeenCalledOnce();
   });
 });

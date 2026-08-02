@@ -15,7 +15,7 @@ import secrets
 import shutil
 import uuid
 from collections import deque
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -1650,6 +1650,97 @@ def create_app(
             return await manager.create_mission_with_main_planning(payload)
         except (KeyError, ValueError, OrchestrationStoreError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.websocket("/ws/missions/create")
+    async def ws_missions_create(ws: WebSocket) -> None:
+        if not _websocket_authenticated(ws):
+            await ws.close(code=1008)
+            return
+        if not _origin_allowed(ws.headers.get("origin")):
+            await ws.close(code=1008)
+            return
+        await ws.accept(subprotocol="openworker" if api_token else None)
+        await ws.send_json({"type": "ready", "data": {}})
+        stream_open = True
+
+        async def emit(event: dict[str, Any]) -> None:
+            nonlocal stream_open
+            if not stream_open:
+                return
+            try:
+                await ws.send_json(event)
+            except Exception:
+                # Planning owns durable Mission state and must finish even if the drawer
+                # or desktop window disappears while the Agent is still producing text.
+                stream_open = False
+
+        try:
+            frame = await ws.receive_json()
+            if not isinstance(frame, dict) or frame.get("type") != "create":
+                await emit(
+                    {
+                        "type": "error",
+                        "data": {
+                            "code": "MISSION_CREATE_MESSAGE_INVALID",
+                            "error": "Expected one create message.",
+                        },
+                    }
+                )
+                await ws.close(code=1008)
+                return
+            payload = frame.get("data")
+            if not isinstance(payload, dict):
+                await emit(
+                    {
+                        "type": "error",
+                        "data": {
+                            "code": "MISSION_CREATE_PAYLOAD_INVALID",
+                            "error": "Mission create data must be an object.",
+                        },
+                    }
+                )
+                await ws.close(code=1008)
+                return
+            spec = payload.get("task_spec") if isinstance(payload.get("task_spec"), dict) else {}
+            if not (payload.get("workspace") or spec.get("workspace")):
+                await emit(
+                    {
+                        "type": "error",
+                        "data": {
+                            "code": "MISSION_WORKSPACE_REQUIRED",
+                            "error": "Mission creation requires a workspace.",
+                        },
+                    }
+                )
+                await ws.close(code=1008)
+                return
+            await manager.create_mission_with_main_planning(payload, update_sink=emit)
+        except WebSocketDisconnect:
+            stream_open = False
+        except (KeyError, ValueError, OrchestrationStoreError) as exc:
+            await emit(
+                {
+                    "type": "error",
+                    "data": {
+                        "code": "MISSION_CREATE_INVALID",
+                        "error": str(exc),
+                    },
+                }
+            )
+        except Exception:
+            await emit(
+                {
+                    "type": "error",
+                    "data": {
+                        "code": "MISSION_CREATE_FAILED",
+                        "error": "Mission planning could not be completed.",
+                    },
+                }
+            )
+        finally:
+            if stream_open:
+                with suppress(Exception):
+                    await ws.close()
 
     @app.get("/v1/missions")
     def missions_list(
