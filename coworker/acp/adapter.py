@@ -173,6 +173,7 @@ class _HostClient:
         self.permission_resolver = permission_resolver
         self.update_sink = update_sink
         self.updates: dict[str, list[NormalizedEvent]] = {}
+        self._update_events: dict[str, asyncio.Event] = {}
         self.connection: Any = None
 
     def on_connect(self, conn: Any) -> None:
@@ -191,7 +192,31 @@ class _HostClient:
         ):
             event["text"] = update.content.text
         self.updates.setdefault(session_id, []).append(event)
+        self._update_events.setdefault(session_id, asyncio.Event()).set()
         await _emit(self.update_sink, event)
+
+    async def wait_for_update_after(
+        self, session_id: str, count: int, timeout: float
+    ) -> bool:
+        """Wait until a notification handler appends an update after ``count``.
+
+        ACP's dispatcher handles notifications in background tasks, while a following
+        prompt response can resolve immediately.  The wire still preserves ordering,
+        but the callback that fills ``updates`` may finish one event-loop turn later.
+        Double-checking around ``clear`` prevents losing an update at that boundary.
+        """
+
+        if len(self.updates.get(session_id, ())) > count:
+            return True
+        event = self._update_events.setdefault(session_id, asyncio.Event())
+        event.clear()
+        if len(self.updates.get(session_id, ())) > count:
+            return True
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return False
+        return len(self.updates.get(session_id, ())) > count
 
     async def request_permission(
         self,
@@ -476,9 +501,13 @@ class AcpAgentAdapter:
             finally:
                 runtime.busy = False
 
-            events = tuple(runtime.client.updates.get(runtime.session_id, ())[cursor:])
-            text = "".join(str(event.get("text", "")) for event in events)
             stop_reason = str(getattr(response, "stop_reason", "end_turn"))
+            events = tuple(runtime.client.updates.get(runtime.session_id, ())[cursor:])
+            if stop_reason == "end_turn" and not _has_meaningful_turn_output(events):
+                events = await _settle_turn_updates(
+                    runtime.client, runtime.session_id, cursor
+                )
+            text = "".join(str(event.get("text", "")) for event in events)
             if stop_reason == "end_turn" and not _has_meaningful_turn_output(events):
                 await _emit(
                     self.update_sink,
@@ -721,6 +750,38 @@ async def _emit(sink: Optional[UpdateSink], event: NormalizedEvent) -> None:
     result = sink(event)
     if inspect.isawaitable(result):
         await result
+
+
+async def _settle_turn_updates(
+    client: Any,
+    session_id: str,
+    cursor: int,
+    *,
+    grace_seconds: float = 0.25,
+) -> tuple[NormalizedEvent, ...]:
+    """Let queued ACP notifications catch up with their already-read response.
+
+    ``agent-client-protocol`` dispatches notifications as background tasks.  A prompt
+    response that follows them on the wire can therefore wake the requester before the
+    host callback has appended the preceding message chunk.  Wait only on the concrete
+    host notification signal and only while the turn still looks empty.
+    """
+
+    waiter = getattr(client, "wait_for_update_after", None)
+    events = tuple(client.updates.get(session_id, ())[cursor:])
+    if not callable(waiter):
+        return events
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + grace_seconds
+    while not _has_meaningful_turn_output(events):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        changed = await waiter(session_id, cursor + len(events), remaining)
+        events = tuple(client.updates.get(session_id, ())[cursor:])
+        if not changed:
+            break
+    return events
 
 
 async def _terminate(process: asyncio.subprocess.Process) -> None:

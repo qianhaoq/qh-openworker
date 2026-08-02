@@ -7,7 +7,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from acp import update_agent_message_text
+
 from coworker.acp import AcpAgentAdapter, AcpEmptyTurnError, AcpSessionHandle
+from coworker.acp.adapter import _HostClient
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "fake_acp_agent.py"
@@ -157,6 +160,64 @@ async def test_end_turn_without_agent_message_chunk_is_failed():
 
     assert "acp.turn_failed" in [event["type"] for event in events]
     assert "acp.turn_finished" not in [event["type"] for event in events]
+
+
+@pytest.mark.asyncio
+async def test_end_turn_waits_for_preceding_queued_notification():
+    session_id = "delayed-update-session"
+    handle = AcpSessionHandle(
+        runtime_id="runtime-delayed-update",
+        profile_id="fake-main",
+        role="main",
+        session_id=session_id,
+        cwd="/tmp",
+        capabilities={},
+        recovery_mode="new",
+        process_id=None,
+    )
+    client = _HostClient(
+        profile_id=handle.profile_id,
+        role=handle.role,
+        permission_policy="coding-default",
+        permission_resolver=None,
+        update_sink=None,
+    )
+
+    class ResponseBeforeNotificationConnection:
+        async def prompt(self, *, session_id: str, prompt: list[object]):
+            async def publish_queued_notification() -> None:
+                # Keep the callback observably later than the response so the test
+                # deterministically exercises the SDK dispatch race on every Python version.
+                await asyncio.sleep(0.01)
+                await client.session_update(
+                    session_id,
+                    update_agent_message_text("arrived after response"),
+                )
+
+            asyncio.create_task(publish_queued_notification())
+            return SimpleNamespace(stop_reason="end_turn")
+
+    runtime = SimpleNamespace(
+        runtime_id=handle.runtime_id,
+        profile={"id": handle.profile_id},
+        role=handle.role,
+        cwd=handle.cwd,
+        client=client,
+        connection=ResponseBeforeNotificationConnection(),
+        process=SimpleNamespace(returncode=None),
+        capabilities={},
+        timeout_seconds=5,
+        session_id=session_id,
+        prompt_lock=asyncio.Lock(),
+        busy=False,
+    )
+    adapter = AcpAgentAdapter()
+    adapter._runtimes[handle.runtime_id] = runtime
+
+    result = await adapter.prompt(handle, "hello")
+
+    assert result.text == "arrived after response"
+    assert [event["update_type"] for event in result.events] == ["AgentMessageChunk"]
 
 
 @pytest.mark.asyncio
