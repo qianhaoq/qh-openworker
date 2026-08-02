@@ -16,7 +16,7 @@ test("the home greets with a time-aware greeting and a status summary", async ({
   await expect(greeting).toHaveText(/^(早上好|下午好|晚上好)$/);
   // Date line ("8月2日 星期六" shape) and Q's partner subline.
   await expect(page.getByTestId("home-date")).toHaveText(/^\d{1,2}月\d{1,2}日 星期[日一二三四五六]$/);
-  await expect(page.getByText("我是 Q，你的本地工作伙伴。今天想从哪开始？")).toBeVisible();
+  await expect(page.getByText("我是 Q，你的本地工作伙伴。把目标变成 Mission，再由本地 Agent 执行和回报。")).toBeVisible();
   // Two inbox items wait → the summary leads with them.
   await expect(page.getByTestId("home-summary")).toHaveText("有 2 项审批在等你，处理完就清爽了。");
 });
@@ -55,9 +55,9 @@ test("cards navigate to their surfaces", async ({ page }) => {
   await expect(page).toHaveURL(/#\/missions$/);
 });
 
-test("开始新会话 opens the idle hero and recent rows open their session", async ({ page }) => {
+test("快速对话 opens the idle hero and recent rows open their session", async ({ page }) => {
   await page.goto("/#/assistant");
-  await page.getByRole("button", { name: "开始新会话" }).click();
+  await page.getByRole("button", { name: "开始快速对话" }).click();
   await expect(page).toHaveURL(/#\/assistant\/.+/);
   await expect(page.getByRole("heading", { name: "有什么想让我帮忙的？" })).toBeVisible();
 

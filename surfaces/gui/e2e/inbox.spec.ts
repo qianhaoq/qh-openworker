@@ -27,7 +27,7 @@ test("allowing an approval moves it to 已处理 and updates the badge", async (
   await expect(page.getByText("Approve: run_shell", { exact: true })).toBeHidden();
   await expect(page.getByText("Which environment should I restart?", { exact: true })).toBeVisible();
   // The sidebar badge drops to 1.
-  await expect(page.getByRole("link", { name: /收件箱/ })).toContainText("1");
+  await expect(page.getByRole("link", { name: /审批/ })).toContainText("1");
 
   await page.getByRole("tab", { name: /已处理/ }).click();
   await expect(page.getByText("Approve: run_shell", { exact: true })).toBeVisible();

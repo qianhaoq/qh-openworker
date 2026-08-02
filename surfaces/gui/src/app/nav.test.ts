@@ -2,15 +2,15 @@ import { describe, expect, it } from "vitest";
 import { DEFAULT_ROUTE, matchSegments, parseHash } from "./nav";
 
 describe("parseHash", () => {
-  it("defaults to the assistant route for empty hashes", () => {
+  it("defaults to the home route for empty hashes", () => {
     for (const hash of ["", "#", "#/"]) {
       expect(parseHash(hash)).toEqual(DEFAULT_ROUTE);
     }
   });
 
-  it("matches every top-level route", () => {
+  it("matches the mission-first top-level routes and hidden secondary routes", () => {
     for (const name of [
-      "assistant",
+      "home",
       "agents",
       "missions",
       "inbox",
@@ -20,6 +20,10 @@ describe("parseHash", () => {
     ] as const) {
       expect(parseHash(`#/${name}`)).toEqual({ name, params: {} });
     }
+  });
+
+  it("redirects the old assistant landing route to home", () => {
+    expect(parseHash("#/assistant")).toEqual(DEFAULT_ROUTE);
   });
 
   it("captures dynamic segments", () => {

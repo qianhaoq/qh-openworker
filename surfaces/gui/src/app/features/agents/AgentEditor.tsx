@@ -4,7 +4,7 @@
 
 import { useMemo, useState, type ReactNode } from "react";
 import type { AgentProfile, AgentRole, Transport } from "../../lib/api/types";
-import { Icon } from "../../components/Icon";
+import { Drawer } from "../../components/Drawer";
 import { Switch } from "../../components/Switch";
 import {
   PERMISSION_POLICIES,
@@ -50,7 +50,7 @@ export interface AgentEditorProps {
   probeError?: string;
   busy: boolean;
   onSave: (profile: AgentProfile) => Promise<ActionResult>;
-  onProbe: (profileId: string) => Promise<ActionResult>;
+  onActivate: (profileId: string) => Promise<ActionResult>;
   onSetEnabled: (profile: AgentProfile, enabled: boolean) => Promise<ActionResult>;
   onSetMain: (profileId: string) => Promise<ActionResult>;
   onDelete: (profileId: string) => Promise<ActionResult>;
@@ -99,7 +99,7 @@ export function AgentEditor({
   probeError,
   busy,
   onSave,
-  onProbe,
+  onActivate,
   onSetEnabled,
   onSetMain,
   onDelete,
@@ -167,10 +167,33 @@ export function AgentEditor({
     }
   };
 
-  const probe = async () => {
-    if (!saved) return;
-    const result = await onProbe(saved.id);
-    flash(result, result.ok ? "探测成功，能力已记录。" : "");
+  const saveAndActivate = async () => {
+    const args = parseArgsJson(argsText);
+    if (!args.ok) {
+      setError(args.error);
+      return;
+    }
+    const next: AgentProfile = {
+      ...draft,
+      id: draft.id.trim(),
+      command: draft.command.trim(),
+      args: args.args,
+      model_profile: draft.model_profile?.trim() || null,
+      secret_refs: parseSecretRefs(secretText),
+      enabled: false,
+      capabilities: {},
+      capability_probe_fingerprint: null,
+    };
+    const invalid = validateProfile(next, existingIds, originalId);
+    if (invalid) {
+      setError(invalid);
+      return;
+    }
+    const savedResult = await onSave(next);
+    if (!flash(savedResult, "已保存草稿，正在测试 runtime。")) return;
+    if (isNew) onSaved(next.id);
+    const activated = await onActivate(next.id);
+    flash(activated, "测试成功，Agent 已启用并记录能力。");
   };
 
   const toggleEnabled = async (enabled: boolean) => {
@@ -192,40 +215,73 @@ export function AgentEditor({
     else flash(result, "");
   };
 
+  const dirty =
+    JSON.stringify(draft) !== JSON.stringify(initial) ||
+    argsText !== JSON.stringify(initial.args ?? []) ||
+    secretText !== formatSecretRefs(initial.secret_refs ?? []);
+
   return (
-    <>
-      <div className="fixed inset-0 z-30 bg-black/20" onClick={onClose} aria-hidden="true" />
-      <aside
-        className="fixed inset-y-0 right-0 z-40 flex w-[440px] max-w-full flex-col border-l border-line bg-paper shadow-2xl"
-        role="dialog"
-        aria-label={isNew ? "招募 Agent" : `编辑 ${originalId}`}
-      >
-        {/* header */}
-        <div className="flex items-center justify-between border-b border-line bg-panel px-4 py-3">
-          <div className="flex items-center gap-2.5">
+    <Drawer
+      title={isNew ? "招募 Agent" : draft.id}
+      dirty={dirty && !busy && !probing}
+      initialFocus="#agent-profile-id"
+      onClose={onClose}
+      icon={
             <span className={`grid h-7 w-7 place-items-center rounded-lg text-[12px] font-semibold ${roleMeta(draft.role).tint}`}>
               {roleMeta(draft.role).label}
             </span>
-            <div className="text-[13.5px] font-semibold tracking-tight">
-              {isNew ? "招募 Agent" : draft.id}
-            </div>
+      }
+      footer={
+        <div className="border-t border-line bg-panel px-4 py-3">
+          <div className="mb-2 text-[11px] leading-relaxed text-faint">
+            添加并测试会先保存禁用草稿，再启动 runtime 协商能力；失败时草稿保留但不可用。
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            title="关闭"
-            className="grid h-6 w-6 place-items-center rounded text-faint hover:bg-paper hover:text-ink"
-          >
-            <Icon name="close" size={14} />
-          </button>
+          <div className="flex items-center gap-2">
+            {!isNew &&
+              (confirmingDelete ? (
+                <span className="flex items-center gap-1.5">
+                  <button type="button" className={BTN_DANGER} disabled={busy} onClick={() => void remove()}>
+                    确认删除
+                  </button>
+                  <button type="button" className={BTN} onClick={() => setConfirmingDelete(false)}>
+                    取消
+                  </button>
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  className={BTN_DANGER}
+                  disabled={busy}
+                  onClick={() => setConfirmingDelete(true)}
+                >
+                  删除
+                </button>
+              ))}
+            <span className="flex-1" />
+            <button type="button" className={BTN} disabled={busy || !!argsError} onClick={() => void save()}>
+              保存草稿
+            </button>
+            <button type="button" className={BTN_ACCENT} disabled={busy || probing || !!argsError} onClick={() => void saveAndActivate()}>
+              {busy || probing ? (
+                <span className="flex items-center gap-1.5">
+                  <span className="spinner" /> 测试中
+                </span>
+              ) : isNew ? (
+                "添加并测试"
+              ) : (
+                "保存并测试"
+              )}
+            </button>
+          </div>
         </div>
-
-        {/* body */}
-        <div className="hairline-scroll flex-1 overflow-y-auto px-4 pb-4">
+      }
+    >
+        <div className="px-4 pb-4">
           <div className={GRP_H}>基本信息</div>
           <div className={`${GRP} divide-y divide-line`}>
             <Field label="Profile ID">
               <input
+                id="agent-profile-id"
                 className={`${FIELD} font-mono`}
                 value={draft.id}
                 disabled={!isNew}
@@ -246,6 +302,30 @@ export function AgentEditor({
                 ))}
               </select>
             </Field>
+            <Field label="Command">
+              <input
+                className={`${FIELD} font-mono`}
+                value={draft.command}
+                onChange={(e) => setDraft({ ...draft, command: e.target.value })}
+                placeholder="kimi"
+              />
+            </Field>
+            <Field label="Model profile">
+              <input
+                className={`${FIELD} font-mono`}
+                value={draft.model_profile ?? ""}
+                onChange={(e) => setDraft({ ...draft, model_profile: e.target.value })}
+                placeholder="可选"
+              />
+            </Field>
+          </div>
+
+          <details className="mt-5" open={!isNew}>
+            <summary className="cursor-pointer px-1 text-[12px] font-semibold text-muted">
+              高级配置
+            </summary>
+          <div className={GRP_H}>启动</div>
+          <div className={`${GRP} divide-y divide-line`}>
             <Field label="Transport">
               <select
                 className={FIELD}
@@ -258,14 +338,6 @@ export function AgentEditor({
                   </option>
                 ))}
               </select>
-            </Field>
-            <Field label="Command">
-              <input
-                className={`${FIELD} font-mono`}
-                value={draft.command}
-                onChange={(e) => setDraft({ ...draft, command: e.target.value })}
-                placeholder="kimi"
-              />
             </Field>
             <Field
               stack
@@ -280,16 +352,19 @@ export function AgentEditor({
               />
               {argsError && <div className="mt-1 text-[11px] text-danger">{argsError}</div>}
             </Field>
-            <Field label="Model profile">
+            <Field
+              label="Secret 引用"
+              hint={draft.role === "reviewer" ? "审查角色不能引用 secret" : "本地密钥名，逗号分隔；只存引用，不存值"}
+            >
               <input
                 className={`${FIELD} font-mono`}
-                value={draft.model_profile ?? ""}
-                onChange={(e) => setDraft({ ...draft, model_profile: e.target.value })}
-                placeholder="可选"
+                value={secretText}
+                disabled={draft.role === "reviewer"}
+                onChange={(e) => setSecretText(e.target.value)}
+                placeholder="KIMI_API_KEY"
               />
             </Field>
           </div>
-
           <div className={GRP_H}>权限与密钥</div>
           <p className="mb-1 px-1 text-[11px] leading-snug text-faint">
             这些是宿主强制的 ACP 权限策略；Agent 二进制是受信本地代码，不等同 OS sandbox。
@@ -323,19 +398,8 @@ export function AgentEditor({
                 ))}
               </select>
             </Field>
-            <Field
-              label="Secret 引用"
-              hint={draft.role === "reviewer" ? "审查角色不能引用 secret" : "本地密钥名，逗号分隔；只存引用，不存值"}
-            >
-              <input
-                className={`${FIELD} font-mono`}
-                value={secretText}
-                disabled={draft.role === "reviewer"}
-                onChange={(e) => setSecretText(e.target.value)}
-                placeholder="KIMI_API_KEY"
-              />
-            </Field>
           </div>
+          </details>
 
           {/* status / lifecycle */}
           <div className={GRP_H}>状态</div>
@@ -421,54 +485,6 @@ export function AgentEditor({
           {notice && <p className="mt-3 text-[12px] text-ok">{notice}</p>}
         </div>
 
-        {/* footer */}
-        <div className="border-t border-line bg-panel px-4 py-3">
-          <div className="mb-2 text-[11px] leading-relaxed text-faint">
-            保存后 profile 处于禁用状态；探测通过后才能启用。
-          </div>
-          <div className="flex items-center gap-2">
-            {!isNew &&
-              (confirmingDelete ? (
-                <span className="flex items-center gap-1.5">
-                  <button type="button" className={BTN_DANGER} disabled={busy} onClick={() => void remove()}>
-                    确认删除
-                  </button>
-                  <button type="button" className={BTN} onClick={() => setConfirmingDelete(false)}>
-                    取消
-                  </button>
-                </span>
-              ) : (
-                <button
-                  type="button"
-                  className={BTN_DANGER}
-                  disabled={busy}
-                  onClick={() => setConfirmingDelete(true)}
-                >
-                  删除
-                </button>
-              ))}
-            <span className="flex-1" />
-            <button
-              type="button"
-              className={BTN}
-              disabled={busy || !saved || probing}
-              title={!saved ? "先保存再探测" : undefined}
-              onClick={() => void probe()}
-            >
-              {probing ? (
-                <span className="flex items-center gap-1.5">
-                  <span className="spinner" /> 探测中
-                </span>
-              ) : (
-                "探测"
-              )}
-            </button>
-            <button type="button" className={BTN_ACCENT} disabled={busy || !!argsError} onClick={() => void save()}>
-              保存
-            </button>
-          </div>
-        </div>
-      </aside>
-    </>
+    </Drawer>
   );
 }

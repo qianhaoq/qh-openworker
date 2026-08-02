@@ -21,8 +21,8 @@ export function IntegrationsPage() {
   const [tab, setTab] = useState<Tab>("connectors");
 
   return (
-    <div data-tauri-drag-region className="flex h-full">
-      <nav data-tauri-drag-region className="w-[208px] shrink-0 border-r border-line bg-panel/40 px-3 py-6">
+    <div className="flex h-full">
+      <nav className="w-[208px] shrink-0 border-r border-line bg-panel/40 px-3 py-6">
         <div className="mb-3 px-2 text-[13.5px] font-semibold tracking-tight">集成</div>
         <div className="space-y-0.5">
           {TABS.map(({ key, label }) => (

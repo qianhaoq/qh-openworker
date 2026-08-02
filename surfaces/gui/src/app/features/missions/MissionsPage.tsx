@@ -2,13 +2,13 @@
 // 列表:状态筛选 chips + 任务行 + 「新建任务」drawer(目标 → 创建 → 直达详情页确认计划)。
 
 import { useEffect, useState, type FormEvent } from "react";
+import { Drawer } from "../../components/Drawer";
 import { Icon } from "../../components/Icon";
 import { navigate, useRoute } from "../../nav";
-import { listAgentProfiles } from "../../lib/api/agents";
 import { getRecentWorkspaces, openWorkspace, pickFolderViaServer } from "../../lib/api/sessions";
-import type { AgentProfile, Mission, RecentWorkspace } from "../../lib/api/types";
+import { getReadiness } from "../../lib/api/settings";
+import type { Mission, Readiness, RecentWorkspace } from "../../lib/api/types";
 import { humanizeErrorText } from "../../lib/errorText";
-import { hasUsableExecutor } from "../agents/agentLogic";
 import { MissionDetailPage } from "./MissionDetailPage";
 import {
   MISSION_FILTERS,
@@ -84,19 +84,7 @@ function CreateMissionDrawer({
   const [workspace, setWorkspace] = useState("");
   const [recentWorkspaces, setRecentWorkspaces] = useState<RecentWorkspace[]>([]);
   const [error, setError] = useState<string | null>(null);
-  // Pre-check: creating needs an enabled + probed executor profile (the backend 400s
-  // with a cryptic message otherwise). null = still loading / load failed — don't gate.
-  const [profiles, setProfiles] = useState<AgentProfile[] | null>(null);
-
-  useEffect(() => {
-    let stale = false;
-    listAgentProfiles()
-      .then((list) => !stale && setProfiles(list))
-      .catch(() => {});
-    return () => {
-      stale = true;
-    };
-  }, []);
+  const [readiness, setReadiness] = useState<Readiness | null>(null);
 
   useEffect(() => {
     let stale = false;
@@ -113,7 +101,30 @@ function CreateMissionDrawer({
     };
   }, []);
 
-  const executorMissing = profiles !== null && !hasUsableExecutor(profiles);
+  useEffect(() => {
+    let stale = false;
+    getReadiness(workspace || undefined)
+      .then((value) => {
+        if (!stale) setReadiness(value);
+      })
+      .catch(() => {
+        if (!stale) setReadiness(null);
+      });
+    return () => {
+      stale = true;
+    };
+  }, [workspace]);
+
+  const readinessError =
+    readiness && !readiness.can_create_mission
+      ? readiness.next_action === "choose_workspace"
+        ? "需要先选择一个可用 workspace。"
+        : readiness.next_action === "select_main_agent"
+          ? "当前 workspace 缺少 main Agent。"
+          : readiness.next_action === "activate_main_agent"
+            ? "当前 workspace 的 main Agent 还未激活。"
+            : "当前 workspace 的 main Agent 不可用。"
+      : null;
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -122,7 +133,7 @@ function CreateMissionDrawer({
       setError(invalidWorkspace);
       return;
     }
-    if (!goal.trim() || creating || executorMissing) return;
+    if (!goal.trim() || creating || readinessError) return;
     setError(null);
     const failure = await onCreate(goal, workspace);
     // The raw 400 can still slip through (profile flipped between load and submit).
@@ -137,25 +148,36 @@ function CreateMissionDrawer({
   };
 
   return (
-    <>
-      <div className="fixed inset-0 z-30 bg-black/20" onClick={onClose} aria-hidden="true" />
-      <aside
-        className="fixed inset-y-0 right-0 z-40 flex w-[440px] max-w-full flex-col border-l border-line bg-paper shadow-2xl"
-        role="dialog"
-        aria-label="新建任务"
-      >
-        <div className="flex items-center justify-between border-b border-line bg-panel px-4 py-3">
-          <div className="text-[13.5px] font-semibold tracking-tight">新建任务</div>
-          <button
-            type="button"
-            onClick={onClose}
-            title="关闭"
-            className="grid h-6 w-6 place-items-center rounded text-faint hover:bg-paper hover:text-ink"
-          >
-            <Icon name="close" size={14} />
-          </button>
+    <Drawer
+      title="新建 Mission"
+      dirty={Boolean(goal.trim())}
+      initialFocus="#mission-goal"
+      onClose={onClose}
+      footer={
+        <div className="border-t border-line bg-panel px-4 py-3">
+          <div className="flex justify-end gap-2">
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-lg border border-line bg-panel px-3.5 py-1.5 text-[12.5px] hover:border-lineStrong"
+            >
+              取消
+            </button>
+            <button
+              type="submit"
+              form="mission-create-form"
+              disabled={!goal.trim() || !workspace.trim() || creating || Boolean(readinessError)}
+              title={readinessError || undefined}
+              className="flex items-center gap-1.5 rounded-lg bg-accent px-3.5 py-1.5 text-[12.5px] font-medium text-white hover:brightness-105 disabled:opacity-40"
+            >
+              {creating ? <span className="spinner" /> : <Icon name="sparkle" size={14} />}
+              创建 Mission
+            </button>
+          </div>
         </div>
-        <form onSubmit={(event) => void submit(event)} className="flex flex-1 flex-col p-4">
+      }
+    >
+        <form id="mission-create-form" onSubmit={(event) => void submit(event)} className="flex min-h-full flex-col p-4">
           <p className="text-[12.5px] leading-relaxed text-muted">
             描述目标后,主 Agent 会提出结构化的团队计划;你确认前不会启动任何写入型执行。
           </p>
@@ -205,18 +227,18 @@ function CreateMissionDrawer({
               {error}
             </p>
           )}
-          {executorMissing && (
+          {readinessError && (
             <div
               className="mt-3 rounded-lg bg-warnSoft px-3 py-2 text-[12.5px] leading-relaxed text-warnInk"
-              data-testid="executor-missing-notice"
+              data-testid="mission-readiness-notice"
             >
-              需要先在 Agents 页招募并启用一个「执行」角色的 agent,才能创建任务。
+              {readinessError}
               <button
                 type="button"
-                onClick={() => navigate("agents")}
+                onClick={() => navigate(readiness?.next_action === "fix_main_agent" ? "agents" : "home")}
                 className="mt-1.5 flex items-center gap-1 rounded-md border border-warnInk/30 px-2 py-0.5 text-[11.5px] font-medium hover:opacity-80"
               >
-                前往 Agents
+                前往修复
                 <Icon name="chevronRight" size={12} />
               </button>
             </div>
@@ -236,27 +258,8 @@ function CreateMissionDrawer({
               </pre>
             </div>
           )}
-          <div className="mt-auto flex justify-end gap-2 pt-4">
-            <button
-              type="button"
-              onClick={onClose}
-              className="rounded-lg border border-line bg-panel px-3.5 py-1.5 text-[12.5px] hover:border-lineStrong"
-            >
-              取消
-            </button>
-            <button
-              type="submit"
-              disabled={!goal.trim() || !workspace.trim() || creating || executorMissing}
-              title={executorMissing ? "需要先在 Agents 页启用一个「执行」角色的 agent" : undefined}
-              className="flex items-center gap-1.5 rounded-lg bg-accent px-3.5 py-1.5 text-[12.5px] font-medium text-white hover:brightness-105 disabled:opacity-40"
-            >
-              {creating ? <span className="spinner" /> : <Icon name="sparkle" size={14} />}
-              创建任务
-            </button>
-          </div>
         </form>
-      </aside>
-    </>
+    </Drawer>
   );
 }
 
@@ -278,10 +281,10 @@ function MissionListPage() {
   };
 
   return (
-    <div data-tauri-drag-region className="mx-auto max-w-3xl px-8 py-8">
+    <div className="mx-auto max-w-3xl px-8 py-8">
       <header data-tauri-drag-region className="flex items-start justify-between gap-4">
         <div>
-          <h1 className="text-[22px] font-semibold tracking-tight">任务</h1>
+          <h1 className="text-[22px] font-semibold tracking-tight">Missions</h1>
           <p className="mt-1 text-[13px] text-muted">
             把目标交给可审计的本地 Agent 团队:先确认计划,再跟踪执行、审查与交付。
           </p>
@@ -292,7 +295,7 @@ function MissionListPage() {
           className="flex shrink-0 items-center gap-1.5 rounded-lg bg-accent px-3.5 py-1.5 text-[13px] font-medium text-white hover:brightness-105"
         >
           <Icon name="plus" size={14} />
-          新建任务
+          新建 Mission
         </button>
       </header>
 
@@ -336,12 +339,12 @@ function MissionListPage() {
             <Icon name="missions" size={20} />
           </div>
           <h2 className="mt-4 text-[15px] font-semibold tracking-tight">
-            {missions.length === 0 ? "还没有任务" : "没有匹配的任务"}
+            {missions.length === 0 ? "还没有 Mission" : "没有匹配的 Mission"}
           </h2>
           <p className="mt-1.5 max-w-sm text-[13px] leading-relaxed text-muted">
             {missions.length === 0
-              ? "新建一个任务,主 Agent 会先提出团队计划,确认后开始执行。"
-              : "切换上方筛选,或新建一个任务。"}
+              ? "新建一个 Mission,主 Agent 会先提出团队计划,确认后开始执行。"
+              : "切换上方筛选,或新建一个 Mission。"}
           </p>
           {missions.length === 0 && (
             <button
@@ -350,7 +353,7 @@ function MissionListPage() {
               className="mt-5 flex items-center gap-1.5 rounded-lg bg-accent px-3.5 py-1.5 text-[13px] font-medium text-white hover:brightness-105"
             >
               <Icon name="plus" size={14} />
-              新建任务
+              新建 Mission
             </button>
           )}
         </div>

@@ -4,6 +4,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import {
+  activateAgentProfile,
   deleteAgentProfile,
   getWorkspaceMainAgent,
   listAgentProfiles,
@@ -112,6 +113,40 @@ export function useAgentProfiles() {
     [refresh],
   );
 
+  const activate = useCallback(
+    async (profileId: string): Promise<ActionResult> => {
+      setProbingIds((current) => new Set(current).add(profileId));
+      setProbeErrors((current) => {
+        const next = { ...current };
+        delete next[profileId];
+        return next;
+      });
+      markBusy(profileId, true);
+      try {
+        const result = await activateAgentProfile(profileId);
+        if (!result.ok) {
+          const error = humanizeErrorText(result.error || "激活失败");
+          setProbeErrors((current) => ({ ...current, [profileId]: error }));
+          return { ok: false, error };
+        }
+        await refresh();
+        return { ok: true, capabilities: result.capabilities };
+      } catch (error) {
+        const text = humanizeErrorText(message(error));
+        setProbeErrors((current) => ({ ...current, [profileId]: text }));
+        return { ok: false, error: text };
+      } finally {
+        setProbingIds((current) => {
+          const next = new Set(current);
+          next.delete(profileId);
+          return next;
+        });
+        markBusy(profileId, false);
+      }
+    },
+    [refresh],
+  );
+
   const setEnabled = useCallback(
     async (profile: AgentProfile, enabled: boolean): Promise<ActionResult> => {
       markBusy(profile.id, true);
@@ -174,6 +209,7 @@ export function useAgentProfiles() {
     refresh,
     save,
     probe,
+    activate,
     setEnabled,
     remove,
     setMain,

@@ -34,6 +34,8 @@
   --teal-ink: #0f766e;
   --teal-soft: #edfafa;
   --teal-line: #cfebea;
+  --review-ink: #6d4cc7;
+  --review-soft: #f1edff;
   --solid: #e9ebf0;
   --on-solid: #1f2227;
 }
@@ -64,6 +66,8 @@ html[data-theme="dark"] {
   --teal-ink: #46c0b2;
   --teal-soft: #11302d;
   --teal-line: #1f4a45;
+  --review-ink: #b9a1ff;
+  --review-soft: #29213d;
   --solid: #2e3138;
   --on-solid: #e6e8eb;
 }
@@ -269,6 +273,30 @@ samp {
   }
 }
 
+/* The helmet's wisp is the brand's only motion. It signals active work rather
+   than decoration; compact 16px marks omit it to keep the neck opening crisp. */
+.brand-mark-compact .brand-smoke {
+  display: none;
+}
+.brand-mark-idle .brand-smoke {
+  opacity: 0;
+}
+.brand-mark-live .brand-smoke {
+  animation: ow-smoke-drift 2.4s ease-in-out infinite;
+  transform-origin: 12px 21px;
+}
+@keyframes ow-smoke-drift {
+  0%,
+  100% {
+    transform: translateY(0.5px);
+    opacity: 0;
+  }
+  50% {
+    transform: translateY(-1px);
+    opacity: 0.95;
+  }
+}
+
 /* Pending prompt cards (permission/question/plan/directory): a slow breathing glow ring
    — "需要你" — that settles back once resolved. Shadow-only so the card's own border
    (hairline, or the warn tint for external-scope approvals) stays authoritative. */
@@ -347,8 +375,13 @@ samp {
   .composer-send-settle,
   .status-dot-thinking,
   .status-dot-connecting,
+  .brand-mark-live .brand-smoke,
   .page-enter {
     animation: none;
+  }
+  .brand-mark-live .brand-smoke {
+    opacity: 0.72;
+    transform: none;
   }
 }
 

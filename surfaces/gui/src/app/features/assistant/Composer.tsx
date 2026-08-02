@@ -138,7 +138,7 @@ export function Composer(props: ComposerProps) {
   useEffect(() => {
     if (!dictation?.recording) return;
     const cancelOnEscape = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
+      if (event.key !== "Escape" || event.defaultPrevented) return;
       event.preventDefault();
       void cancelDictation()
         .catch(() => undefined)

@@ -5,7 +5,7 @@
 
 import { useState } from "react";
 import type { McpServer } from "../../lib/api/types";
-import { Icon } from "../../components/Icon";
+import { Drawer } from "../../components/Drawer";
 import { Switch } from "../../components/Switch";
 import {
   blankMcpForm,
@@ -312,6 +312,7 @@ function McpEditor({
   const [confirmDelete, setConfirmDelete] = useState(false);
   const set = <K extends keyof McpFormState>(key: K, value: McpFormState[K]) =>
     setForm((prev) => ({ ...prev, [key]: value }));
+  const dirty = JSON.stringify(form) !== JSON.stringify(initial);
 
   const submit = async () => {
     const name = (fixedName ?? form.name).trim();
@@ -341,132 +342,12 @@ function McpEditor({
   };
 
   return (
-    <>
-      <div className="fixed inset-0 z-30 bg-black/20" onClick={onClose} aria-hidden="true" />
-      <aside
-        className="fixed inset-y-0 right-0 z-40 flex w-[440px] max-w-full flex-col border-l border-line bg-paper shadow-2xl"
-        role="dialog"
-        aria-label={title}
-      >
-        <div className="flex items-center justify-between border-b border-line bg-panel px-4 py-3">
-          <div className="text-[13.5px] font-semibold tracking-tight">{title}</div>
-          <button
-            type="button"
-            onClick={onClose}
-            title="关闭"
-            className="grid h-6 w-6 place-items-center rounded text-faint hover:bg-paper hover:text-ink"
-          >
-            <Icon name="close" size={14} />
-          </button>
-        </div>
-
-        <div className="hairline-scroll flex-1 space-y-4 overflow-y-auto p-4">
-          <div>
-            <div className="mb-1 text-[12px] font-semibold text-muted">名称</div>
-            <input
-              className={INPUT}
-              value={fixedName ?? form.name}
-              disabled={!!fixedName}
-              placeholder="如 filesystem"
-              spellCheck={false}
-              onChange={(e) => set("name", e.target.value)}
-            />
-          </div>
-
-          <div>
-            <div className="mb-1 text-[12px] font-semibold text-muted">传输方式</div>
-            <div className="inline-flex rounded-full bg-panel p-0.5 text-[12.5px] font-medium shadow-[inset_0_0_0_0.5px_var(--line-strong)]">
-              {(
-                [
-                  ["stdio", "本地命令 (stdio)"],
-                  ["http", "远程 HTTP"],
-                ] as const
-              ).map(([key, label]) => (
-                <button
-                  key={key}
-                  type="button"
-                  className={`rounded-full px-3.5 py-1 ${
-                    form.transport === key ? "bg-paper text-ink shadow-sm" : "text-muted"
-                  }`}
-                  onClick={() => set("transport", key)}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {form.transport === "stdio" ? (
-            <>
-              <div>
-                <div className="mb-1 text-[12px] font-semibold text-muted">启动命令</div>
-                <input
-                  className={`${INPUT} font-mono`}
-                  value={form.command}
-                  placeholder="如 npx 或 uvx"
-                  spellCheck={false}
-                  onChange={(e) => set("command", e.target.value)}
-                />
-              </div>
-              <div>
-                <div className="mb-1 text-[12px] font-semibold text-muted">参数(JSON 数组)</div>
-                <input
-                  className={`${INPUT} font-mono`}
-                  value={form.argsText}
-                  placeholder='["-y","@modelcontextprotocol/server-filesystem"]'
-                  spellCheck={false}
-                  onChange={(e) => set("argsText", e.target.value)}
-                />
-              </div>
-            </>
-          ) : (
-            <>
-              <div>
-                <div className="mb-1 text-[12px] font-semibold text-muted">服务器地址</div>
-                <input
-                  className={`${INPUT} font-mono`}
-                  value={form.url}
-                  placeholder="https://mcp.example.com/mcp"
-                  spellCheck={false}
-                  onChange={(e) => set("url", e.target.value)}
-                />
-              </div>
-              <label className="flex items-center gap-2 text-[13px]">
-                <input
-                  type="checkbox"
-                  className="h-[15px] w-[15px] accent-accent"
-                  checked={form.oauth}
-                  onChange={(e) => set("oauth", e.target.checked)}
-                />
-                需要 OAuth 浏览器登录
-              </label>
-            </>
-          )}
-
-          <div>
-            <div className="mb-1 text-[12px] font-semibold text-muted">环境变量(每行 KEY=VALUE)</div>
-            <textarea
-              className={`${INPUT} resize-y font-mono`}
-              rows={3}
-              value={form.envText}
-              placeholder={"API_KEY=…\nROOT=/tmp"}
-              spellCheck={false}
-              onChange={(e) => set("envText", e.target.value)}
-            />
-            {fixedName && (
-              <p className="mt-1 text-[11.5px] text-faint">
-                *** 是已保存密钥的掩码 — 不动这段文本则原样保留;改动则需重新输入真实值。
-              </p>
-            )}
-          </div>
-
-          {error && (
-            <p className="text-[12px] text-danger" role="alert">
-              {error}
-            </p>
-          )}
-        </div>
-
+    <Drawer
+      title={title}
+      dirty={dirty && !busy}
+      initialFocus={fixedName ? "[data-mcp-field]" : "#mcp-server-name"}
+      onClose={onClose}
+      footer={
         <div className="flex items-center gap-2 border-t border-line bg-panel px-4 py-3">
           <button type="button" className={PILL_ACCENT} onClick={submit} disabled={busy}>
             {busy ? "保存中…" : "保存"}
@@ -513,7 +394,121 @@ function McpEditor({
             </span>
           )}
         </div>
-      </aside>
-    </>
+      }
+    >
+        <div className="space-y-4 p-4">
+          <div>
+            <div className="mb-1 text-[12px] font-semibold text-muted">名称</div>
+            <input
+              id="mcp-server-name"
+              className={INPUT}
+              value={fixedName ?? form.name}
+              disabled={!!fixedName}
+              placeholder="如 filesystem"
+              spellCheck={false}
+              onChange={(e) => set("name", e.target.value)}
+            />
+          </div>
+
+          <div>
+            <div className="mb-1 text-[12px] font-semibold text-muted">传输方式</div>
+            <div className="inline-flex rounded-full bg-panel p-0.5 text-[12.5px] font-medium shadow-[inset_0_0_0_0.5px_var(--line-strong)]">
+              {(
+                [
+                  ["stdio", "本地命令 (stdio)"],
+                  ["http", "远程 HTTP"],
+                ] as const
+              ).map(([key, label]) => (
+                <button
+                  key={key}
+                  type="button"
+                  data-mcp-field
+                  className={`rounded-full px-3.5 py-1 ${
+                    form.transport === key ? "bg-paper text-ink shadow-sm" : "text-muted"
+                  }`}
+                  onClick={() => set("transport", key)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {form.transport === "stdio" ? (
+            <>
+              <div>
+                <div className="mb-1 text-[12px] font-semibold text-muted">启动命令</div>
+                <input
+                  className={`${INPUT} font-mono`}
+                  data-mcp-field
+                  value={form.command}
+                  placeholder="如 npx 或 uvx"
+                  spellCheck={false}
+                  onChange={(e) => set("command", e.target.value)}
+                />
+              </div>
+              <div>
+                <div className="mb-1 text-[12px] font-semibold text-muted">参数(JSON 数组)</div>
+                <input
+                  className={`${INPUT} font-mono`}
+                  data-mcp-field
+                  value={form.argsText}
+                  placeholder='["-y","@modelcontextprotocol/server-filesystem"]'
+                  spellCheck={false}
+                  onChange={(e) => set("argsText", e.target.value)}
+                />
+              </div>
+            </>
+          ) : (
+            <>
+              <div>
+                <div className="mb-1 text-[12px] font-semibold text-muted">服务器地址</div>
+                <input
+                  className={`${INPUT} font-mono`}
+                  data-mcp-field
+                  value={form.url}
+                  placeholder="https://mcp.example.com/mcp"
+                  spellCheck={false}
+                  onChange={(e) => set("url", e.target.value)}
+                />
+              </div>
+              <label className="flex items-center gap-2 text-[13px]">
+                <input
+                  type="checkbox"
+                  className="h-[15px] w-[15px] accent-accent"
+                  data-mcp-field
+                  checked={form.oauth}
+                  onChange={(e) => set("oauth", e.target.checked)}
+                />
+                需要 OAuth 浏览器登录
+              </label>
+            </>
+          )}
+
+          <div>
+            <div className="mb-1 text-[12px] font-semibold text-muted">环境变量(每行 KEY=VALUE)</div>
+            <textarea
+              className={`${INPUT} resize-y font-mono`}
+              data-mcp-field
+              rows={3}
+              value={form.envText}
+              placeholder={"API_KEY=…\nROOT=/tmp"}
+              spellCheck={false}
+              onChange={(e) => set("envText", e.target.value)}
+            />
+            {fixedName && (
+              <p className="mt-1 text-[11.5px] text-faint">
+                *** 是已保存密钥的掩码 — 不动这段文本则原样保留;改动则需重新输入真实值。
+              </p>
+            )}
+          </div>
+
+          {error && (
+            <p className="text-[12px] text-danger" role="alert">
+              {error}
+            </p>
+          )}
+        </div>
+    </Drawer>
   );
 }

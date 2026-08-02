@@ -47,8 +47,8 @@ export function SettingsPage() {
   const [section, setSection] = useState<SectionKey>("appearance");
 
   return (
-    <div data-tauri-drag-region className="mx-auto flex max-w-4xl items-start gap-8 px-8 py-8">
-      <nav data-tauri-drag-region className="sticky top-8 w-[168px] shrink-0" aria-label="设置">
+    <div className="mx-auto flex max-w-4xl items-start gap-8 px-8 py-8">
+      <nav className="sticky top-8 w-[168px] shrink-0" aria-label="设置">
         {SECTIONS.map((item) => {
           const active = item.key === section;
           return (

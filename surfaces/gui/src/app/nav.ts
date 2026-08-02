@@ -1,10 +1,11 @@
 // Tiny hash router — no dependencies. Routes look like "#/missions" with at most one
 // dynamic segment per pattern ("#/missions/:missionId"); anything unrecognized falls
-// back to the assistant. Kept deliberately small: pattern table + parse + a hook.
+// back to the mission-first home.
 
 import { useEffect, useState } from "react";
 
 export type RouteName =
+  | "home"
   | "assistant"
   | "agents"
   | "missions"
@@ -27,6 +28,7 @@ interface RoutePattern {
 
 // The route table — the app's seven top-level pages plus the two detail routes.
 export const ROUTES: readonly RoutePattern[] = [
+  { name: "home", segments: ["home"] },
   { name: "assistant", segments: ["assistant", ":sessionId"] },
   { name: "assistant", segments: ["assistant"] },
   { name: "agents", segments: ["agents"] },
@@ -38,7 +40,7 @@ export const ROUTES: readonly RoutePattern[] = [
   { name: "settings", segments: ["settings"] },
 ];
 
-export const DEFAULT_ROUTE: Route = { name: "assistant", params: {} };
+export const DEFAULT_ROUTE: Route = { name: "home", params: {} };
 
 const splitPath = (path: string): string[] => path.split("/").filter(Boolean);
 
@@ -74,6 +76,7 @@ export function matchSegments(segments: readonly string[]): Route | null {
 /** Parse a location.hash value ("#/missions/m-1") into a Route; falls back to the default. */
 export function parseHash(hash: string): Route {
   const path = hash.replace(/^#/, "").replace(/^\//, "");
+  if (path === "assistant") return DEFAULT_ROUTE;
   return matchSegments(splitPath(path)) ?? DEFAULT_ROUTE;
 }
 

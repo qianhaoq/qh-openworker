@@ -35,6 +35,8 @@ export default {
         tealInk: tok("--teal-ink"),
         tealSoft: tok("--teal-soft"),
         tealLine: tok("--teal-line"),
+        reviewInk: tok("--review-ink"),
+        reviewSoft: tok("--review-soft"),
         solid: tok("--solid"),
         onSolid: tok("--on-solid"),
       },

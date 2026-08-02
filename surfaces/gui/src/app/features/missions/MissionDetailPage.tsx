@@ -184,7 +184,7 @@ export function MissionDetailPage({ missionId }: { missionId: string }) {
   };
 
   return (
-    <div data-tauri-drag-region className="mx-auto max-w-6xl px-8 py-8">
+    <div className="mx-auto max-w-6xl px-8 py-8">
       <button
         type="button"
         onClick={() => navigate("missions")}

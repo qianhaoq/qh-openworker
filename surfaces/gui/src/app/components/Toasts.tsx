@@ -86,11 +86,7 @@ export function toastForEvent(event: AppEvent): Omit<Toast, "id"> | null {
     case "agent_event":
       return null;
     default:
-      return {
-        kind: "info",
-        title: event.type.replace(/_/g, " "),
-        body: pickString(data, ["title", "task_title", "name", "message"]),
-      };
+      return null;
   }
 }
 

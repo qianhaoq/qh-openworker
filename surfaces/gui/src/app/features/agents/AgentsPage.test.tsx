@@ -49,6 +49,7 @@ interface MockController {
   refresh: ReturnType<typeof vi.fn>;
   save: ReturnType<typeof vi.fn>;
   probe: ReturnType<typeof vi.fn>;
+  activate: ReturnType<typeof vi.fn>;
   setEnabled: ReturnType<typeof vi.fn>;
   remove: ReturnType<typeof vi.fn>;
   setMain: ReturnType<typeof vi.fn>;
@@ -65,6 +66,7 @@ const controller = (overrides: Partial<MockController> = {}): MockController => 
   refresh: vi.fn(async () => {}),
   save: vi.fn(async () => ({ ok: true })),
   probe: vi.fn(async () => ({ ok: true })),
+  activate: vi.fn(async () => ({ ok: true })),
   setEnabled: vi.fn(async () => ({ ok: true })),
   remove: vi.fn(async () => ({ ok: true })),
   setMain: vi.fn(async () => ({ ok: true })),
@@ -80,13 +82,13 @@ vi.mock("./useAgentProfiles", () => ({
 afterEach(cleanup);
 
 describe("AgentsPage", () => {
-  it("shows the recruit empty state with preset shortcuts when there are no profiles", () => {
+  it("shows a vacuum empty state without template shortcuts when there are no profiles", () => {
     mock = controller();
     render(<AgentsPage />);
-    expect(screen.getByText("招募你的第一个本地 agent")).toBeTruthy();
-    expect(screen.getByText("OpenCode ACP")).toBeTruthy();
-    expect(screen.getByText("Kimi ACP")).toBeTruthy();
-    expect(screen.getByText("实验性")).toBeTruthy(); // Pi preset badge
+    expect(screen.getByText("还没有 Agent")).toBeTruthy();
+    expect(screen.queryByText("OpenCode ACP")).toBeNull();
+    expect(screen.queryByText("Kimi ACP")).toBeNull();
+    expect(screen.getByText("手动添加")).toBeTruthy();
   });
 
   it("renders rows with main marker, capability badges and probe states", () => {
@@ -110,9 +112,9 @@ describe("AgentsPage", () => {
   it("opens the preset picker from the header action", () => {
     mock = controller({ profiles: [base], mainProfileId: "kimi-main" });
     render(<AgentsPage />);
-    fireEvent.click(screen.getByText("招募 Agent"));
+    fireEvent.click(screen.getByText("添加 Agent"));
     expect(screen.getByText("空白自定义")).toBeTruthy();
-    expect(screen.getByText("Custom ACP stdio")).toBeTruthy();
+    expect(screen.queryByText("Claude Code（Claude 订阅）")).toBeNull();
   });
 
   it("opens the editor on row click and confirms delete inline", () => {

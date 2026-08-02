@@ -3,6 +3,7 @@
 // 产物/审查 drawer 也在这里,与卡片共用一套数据派生(missionLogic)。
 
 import { useState, type FormEvent } from "react";
+import { Drawer } from "../../components/Drawer";
 import { Icon } from "../../components/Icon";
 import { Markdown } from "../../components/Markdown";
 import type { MessageTarget, Mission, PlanMember, TeamArtifact } from "../../lib/api/types";
@@ -264,64 +265,50 @@ export function ArtifactsDrawer({
   const artifacts = artifactsForAttempt(mission, attemptId);
   const [selected, setSelected] = useState<TeamArtifact | null>(null);
   return (
-    <>
-      <div className="fixed inset-0 z-30 bg-black/20" onClick={onClose} aria-hidden="true" />
-      <aside
-        className="fixed inset-y-0 right-0 z-40 flex w-[440px] max-w-full flex-col border-l border-line bg-paper shadow-2xl"
-        role="dialog"
-        aria-label="任务产物"
-      >
-        {selected ? (
-          <ArtifactPreview artifact={selected} onBack={() => setSelected(null)} />
-        ) : (
-          <>
-            <div className="flex items-center justify-between border-b border-line bg-panel px-4 py-3">
-              <div className="text-[13.5px] font-semibold tracking-tight">产物({artifacts.length})</div>
-              <button
-                type="button"
-                onClick={onClose}
-                title="关闭"
-                className="grid h-6 w-6 place-items-center rounded text-faint hover:bg-paper hover:text-ink"
-              >
-                <Icon name="close" size={14} />
-              </button>
+    <Drawer
+      title={selected ? artifactName(selected) : `产物(${artifacts.length})`}
+      initialFocus={selected ? "[aria-label='返回产物列表']" : "[data-artifact-open]"}
+      onClose={onClose}
+      icon={<Icon name="file" size={15} className="text-muted" />}
+    >
+      {selected ? (
+        <ArtifactPreview artifact={selected} onBack={() => setSelected(null)} />
+      ) : (
+        <div className="px-3 py-3">
+          {artifacts.length === 0 ? (
+            <div className="py-8 text-center text-[12.5px] text-faint">
+              暂无工件。diff、测试日志和报告会出现在这里。
             </div>
-            <div className="hairline-scroll flex-1 overflow-y-auto px-3 py-3">
-              {artifacts.length === 0 ? (
-                <div className="py-8 text-center text-[12.5px] text-faint">
-                  暂无工件。diff、测试日志和报告会出现在这里。
-                </div>
-              ) : (
-                <div className="space-y-0.5">
-                  {artifacts.map((artifact) => (
-                    <button
-                      key={artifact.id}
-                      type="button"
-                      onClick={() => setSelected(artifact)}
-                      className="flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left hover:bg-panel"
-                    >
-                      <span
-                        className="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-panel text-muted"
-                        title={artifact.kind}
-                      >
-                        <Icon name={artifactIcon(artifact.kind)} size={15} />
-                      </span>
-                      <span className="min-w-0 flex-1">
-                        <span className="block truncate text-[13px]">{artifactName(artifact)}</span>
-                        <span className="block text-[11px] text-faint">
-                          {artifact.kind || "file"} · {formatTime(artifact.created_at)}
-                        </span>
-                      </span>
-                      <span className="shrink-0 text-[11px] text-faint">打开</span>
-                    </button>
-                  ))}
-                </div>
-              )}
+          ) : (
+            <div className="space-y-0.5">
+              {artifacts.map((artifact) => (
+                <button
+                  key={artifact.id}
+                  type="button"
+                  data-artifact-open
+                  onClick={() => setSelected(artifact)}
+                  className="flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left hover:bg-panel"
+                >
+                  <span
+                    className="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-panel text-muted"
+                    title={artifact.kind}
+                  >
+                    <Icon name={artifactIcon(artifact.kind)} size={15} />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-[13px]">{artifactName(artifact)}</span>
+                    <span className="block text-[11px] text-faint">
+                      {artifact.kind || "file"} · {formatTime(artifact.created_at)}
+                    </span>
+                  </span>
+                  <span className="shrink-0 text-[11px] text-faint">打开</span>
+                </button>
+              ))}
             </div>
-          </>
-        )}
-      </aside>
-    </>
+          )}
+        </div>
+      )}
+    </Drawer>
   );
 }
 
@@ -331,25 +318,12 @@ export function ArtifactsDrawer({
 
 export function ReviewsDrawer({ mission, onClose }: { mission: Mission; onClose: () => void }) {
   return (
-    <>
-      <div className="fixed inset-0 z-30 bg-black/20" onClick={onClose} aria-hidden="true" />
-      <aside
-        className="fixed inset-y-0 right-0 z-40 flex w-[440px] max-w-full flex-col border-l border-line bg-paper shadow-2xl"
-        role="dialog"
-        aria-label="审查结果"
-      >
-        <div className="flex items-center justify-between border-b border-line bg-panel px-4 py-3">
-          <div className="text-[13.5px] font-semibold tracking-tight">审查({mission.reviews.length})</div>
-          <button
-            type="button"
-            onClick={onClose}
-            title="关闭"
-            className="grid h-6 w-6 place-items-center rounded text-faint hover:bg-paper hover:text-ink"
-          >
-            <Icon name="close" size={14} />
-          </button>
-        </div>
-        <div className="hairline-scroll flex-1 overflow-y-auto px-3 py-3">
+    <Drawer
+      title={`审查(${mission.reviews.length})`}
+      onClose={onClose}
+      icon={<Icon name="shield" size={15} className="text-muted" />}
+    >
+        <div className="px-3 py-3">
           {mission.reviews.length === 0 ? (
             <div className="py-8 text-center text-[12.5px] text-faint">
               等待 Reviewer。审查只读查看固定的 diff / 测试工件。
@@ -411,7 +385,6 @@ export function ReviewsDrawer({ mission, onClose }: { mission: Mission; onClose:
             </div>
           )}
         </div>
-      </aside>
-    </>
+    </Drawer>
   );
 }

@@ -55,8 +55,8 @@ for (const theme of THEMES) {
     await expect(page.getByTestId("home-card-approvals")).toContainText("6 项等你处理");
     await capture(page, `assistant-01-home-${theme}`, theme);
 
-    // The new-session idle hero with suggestion chips.
-    await page.getByRole("button", { name: "新会话" }).last().click();
+    // The Home page owns quick chat; the conversation itself still lives on a session route.
+    await page.getByRole("button", { name: "开始快速对话" }).click();
     await expect(page.getByRole("heading", { name: "有什么想让我帮忙的？" })).toBeVisible();
     await capture(page, `assistant-02-new-session-${theme}`, theme);
 
@@ -70,7 +70,7 @@ for (const theme of THEMES) {
         });
       }
     });
-    await page.goto("/#/assistant");
+    await page.goto("/#/assistant/pinned-cowork-1");
     await expect(page.getByText("Draft the launch note", { exact: true }).first()).toBeVisible();
     await page.getByRole("button", { name: /显示已归档/ }).click();
     await expect(page.getByText("Weekly plan 6", { exact: true })).toBeVisible();
@@ -81,7 +81,7 @@ for (const theme of THEMES) {
 // The row ⋯ menu: 重命名 (inline edit) + 删除 (two-step inline confirm). [light]
 test("assistant: session row menu [light]", async ({ page }) => {
   await setTheme(page, "light");
-  await page.goto("/#/assistant");
+  await page.goto("/#/assistant/pinned-cowork-1");
   const row = page.locator("main .group", { hasText: "Weekly plan 1" });
   await row.hover();
   await row.getByTestId("session-row-menu-button").click();
@@ -231,13 +231,13 @@ test("agents: editor drawer + preset picker [light]", async ({ page }) => {
   await expect(page.getByText("已招募（5）")).toBeVisible();
 
   await page.locator("div[role='button']", { hasText: "kimi-main" }).first().click();
-  const editor = page.getByRole("dialog", { name: "编辑 kimi-main" });
+  const editor = page.getByRole("dialog", { name: "kimi-main" });
   await expect(editor).toBeVisible();
   await capture(page, "agents-02-editor-light", "light");
   await editor.getByTitle("关闭").click();
   await expect(editor).toBeHidden();
 
-  await page.getByRole("button", { name: /招募 Agent/ }).click();
+  await page.getByRole("button", { name: "添加 Agent" }).click();
   await expect(page.getByText("OpenCode ACP", { exact: true })).toBeVisible();
   await capture(page, "agents-03-preset-picker-light", "light");
 });
@@ -251,7 +251,7 @@ for (const theme of THEMES) {
   test(`missions: list [${theme}]`, async ({ page }) => {
     await setTheme(page, theme);
     await page.goto("/#/missions");
-    await expect(page.getByRole("heading", { name: "任务" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Missions" })).toBeVisible();
     await expect(page.getByText("重写设置页", { exact: true })).toBeVisible();
     await capture(page, `missions-01-list-${theme}`, theme);
   });
@@ -269,30 +269,38 @@ test("missions: detail + plan editing [light]", async ({ page }) => {
   await capture(page, "missions-03-plan-editing-light", "light");
 });
 
-test("missions: create drawer, with and without a usable executor [light]", async ({ page }) => {
+test("missions: create drawer, with and without a usable main Agent [light]", async ({ page }) => {
   await setTheme(page, "light");
   await page.goto("/#/missions");
-  await page.getByRole("button", { name: /新建任务/ }).first().click();
-  const drawer = page.getByRole("dialog", { name: "新建任务" });
+  await page.getByRole("button", { name: "新建 Mission" }).first().click();
+  const drawer = page.getByRole("dialog", { name: "新建 Mission" });
   await expect(drawer.locator("#mission-goal")).toBeVisible();
   await capture(page, "missions-04-create-drawer-light", "light");
   await drawer.getByTitle("关闭").click();
   await expect(drawer).toBeHidden();
 
-  // Fresh-install state: no enabled + probed executor → submit gated + Agents deep-link.
+  // Fresh-install state: no bound main Agent → submit gated with one repair entry.
   await page.route(
-    (url) => new URL(url).pathname === "/v1/agent-profiles",
+    (url) => new URL(url).pathname === "/v1/readiness",
     (route) =>
       route.fulfill({
         status: 200,
         contentType: "application/json",
-        body: JSON.stringify({ profiles: [] }),
+        body: JSON.stringify({
+          model_ready: false,
+          workspace: "/Users/test/qh-agent",
+          workspace_valid: true,
+          main_agent: "missing",
+          main_profile: null,
+          can_create_mission: false,
+          next_action: "select_main_agent",
+        }),
       }),
   );
-  await page.getByRole("button", { name: /新建任务/ }).first().click();
-  await expect(drawer.getByTestId("executor-missing-notice")).toBeVisible();
-  await expect(drawer.getByRole("button", { name: "创建任务" })).toBeDisabled();
-  await capture(page, "missions-05-create-no-executor-light", "light");
+  await page.getByRole("button", { name: "新建 Mission" }).first().click();
+  await expect(drawer.getByTestId("mission-readiness-notice")).toBeVisible();
+  await expect(drawer.getByRole("button", { name: "创建 Mission" })).toBeDisabled();
+  await capture(page, "missions-05-create-no-main-agent-light", "light");
 });
 
 test("missions: terminal detail hides the composer [light]", async ({ page }) => {
@@ -315,6 +323,17 @@ for (const theme of THEMES) {
     await expect(page.getByText("请求调用")).toBeVisible(); // the ACP permission card
     await expect(page.getByText("Approve: run_shell", { exact: true })).toBeVisible();
     await capture(page, `inbox-01-pending-${theme}`, theme);
+  });
+}
+
+// Product minimum-size review: keep the Mission-first home legible at 1100×720.
+for (const theme of THEMES) {
+  test(`shell: Mission-first home at 1100×720 [${theme}]`, async ({ page }) => {
+    await setTheme(page, theme);
+    await page.setViewportSize({ width: 1100, height: 720 });
+    await page.goto("/#/home");
+    await expect(page.getByTestId("home-greeting")).toBeVisible();
+    await capture(page, `shell-02-home-1100x720-${theme}`, theme);
   });
 }
 

@@ -19,7 +19,7 @@ if (!icons.includes('viewBox="0 0 24 24"')) {
 if (!trayMaster.includes('viewBox="0 0 24 24"')) errors.push("tray master must use a 24x24 viewBox");
 if (!appMaster.includes('viewBox="0 0 1024 1024"')) errors.push("app brand master must use a 1024x1024 viewBox");
 // In-product UI stays flat: glass blur is banned outright, and gradients are
-// allowed only through the approved 伴星 brand tokens (--accent-grad, defined in
+// allowed only through the approved brand tokens (--accent-grad, defined in
 // design.css) — arbitrary ad-hoc gradients remain an error. The app brand master
 // is FINAL 「伴星」 artwork and may use gradients; the tray master is a macOS
 // template icon and must stay monochrome (black + alpha only).
@@ -31,6 +31,10 @@ const cssAdhocGradients = cssNoComments
 if (/backdrop-filter/i.test(cssNoComments) || /gradient/i.test(cssAdhocGradients))
   errors.push("gradients (outside the --accent-grad brand tokens) and glass blur are not allowed in the QH assistant visual system");
 if (/gradient/i.test(trayMaster)) errors.push("tray master must be monochrome (no gradients)");
+if (!appMaster.includes("M512 246") || !trayMaster.includes("M12 3.2"))
+  errors.push("brand masters must contain the approved empty-helmet geometry");
+if (/(?:fill|stroke)=["'](?:#(?:ff[cd][0-9a-f]{3}|ff0)|yellow)/i.test(appMaster + trayMaster))
+  errors.push("brand masters must not use the forbidden yellow-black reference palette");
 for (const [name, width, height] of [
   ["32x32.png", 32, 32],
   ["128x128.png", 128, 128],

@@ -11,6 +11,7 @@ import { Sidebar } from "./components/Sidebar";
 import { Toasts, toastForEvent, useToasts } from "./components/Toasts";
 import { INBOX_CHANGED_EVENT } from "./features/inbox/inboxBadge";
 import { AssistantPage } from "./features/assistant/AssistantPage";
+import { HomePage } from "./features/home/HomePage";
 import { AgentsPage } from "./features/agents/AgentsPage";
 import { MissionsPage } from "./features/missions/MissionsPage";
 import { InboxPage } from "./features/inbox/InboxPage";
@@ -19,6 +20,7 @@ import { IntegrationsPage } from "./features/integrations/IntegrationsPage";
 import { SettingsPage } from "./features/settings/SettingsPage";
 
 const PAGES: Record<RouteName, ComponentType> = {
+  home: HomePage,
   assistant: AssistantPage,
   agents: AgentsPage,
   missions: MissionsPage,
@@ -37,7 +39,7 @@ const loadInboxCount = (): Promise<number> =>
 
 export function App() {
   const route = useRoute();
-  const [collapsed, setCollapsed] = useState(false);
+  const [collapsed, setCollapsed] = useState(() => localStorage.getItem("ocw.sidebar.collapsed") === "true");
   const { toasts, push, dismiss } = useToasts();
   // Pending 事项计数 → 收件箱 nav badge。Refreshes on app-wide events and on every
   // route change (answering items on any surface settles them).
@@ -88,13 +90,19 @@ export function App() {
   }, [route]);
 
   const Page = PAGES[route.name];
+  const toggleCollapsed = () =>
+    setCollapsed((value) => {
+      const next = !value;
+      localStorage.setItem("ocw.sidebar.collapsed", String(next));
+      return next;
+    });
 
   return (
     <div className="flex h-screen overflow-hidden bg-paper font-sans text-ink">
       <Sidebar
         active={route.name}
         collapsed={collapsed}
-        onToggleCollapsed={() => setCollapsed((value) => !value)}
+        onToggleCollapsed={toggleCollapsed}
         badges={{ inbox: inboxCount }}
       />
       <main className="hairline-scroll min-w-0 flex-1 overflow-y-auto">

@@ -11,6 +11,7 @@ import {
   setPersonaEnabled,
 } from "../../lib/api/settings";
 import type { Persona, PersonaConsent, PersonaDetail } from "../../lib/api/types";
+import { Drawer } from "../../components/Drawer";
 import { Icon } from "../../components/Icon";
 import { Switch } from "../../components/Switch";
 import { BTN, BTN_ACCENT, GRP, GRP_H, GRP_NOTE, INPUT, SectionHeader, TAG } from "./controls";
@@ -35,27 +36,8 @@ function PersonaDetailDrawer({ id, onClose }: { id: string; onClose: () => void 
   }, [id]);
 
   return (
-    <>
-      <div className="fixed inset-0 z-30 bg-black/20" onClick={onClose} aria-hidden="true" />
-      <aside
-        className="fixed inset-y-0 right-0 z-40 flex w-[440px] max-w-full flex-col border-l border-line bg-paper shadow-2xl"
-        role="dialog"
-        aria-label="Persona 详情"
-      >
-        <div className="flex items-center justify-between border-b border-line bg-panel px-4 py-3">
-          <div className="truncate text-[13.5px] font-semibold tracking-tight">
-            {detail?.name || "Persona 详情"}
-          </div>
-          <button
-            type="button"
-            onClick={onClose}
-            title="关闭"
-            className="grid h-6 w-6 place-items-center rounded text-faint hover:bg-paper hover:text-ink"
-          >
-            <Icon name="close" size={14} />
-          </button>
-        </div>
-        <div className="hairline-scroll flex-1 overflow-y-auto p-4">
+    <Drawer title={detail?.name || "Persona 详情"} onClose={onClose}>
+        <div className="p-4">
           {error ? (
             <p className="text-[12.5px] text-danger" role="alert">
               {error}
@@ -115,8 +97,7 @@ function PersonaDetailDrawer({ id, onClose }: { id: string; onClose: () => void 
             </>
           )}
         </div>
-      </aside>
-    </>
+    </Drawer>
   );
 }
 

@@ -50,13 +50,17 @@ export type IconName =
   | "dots";
 
 const PATHS: Record<IconName, ReactNode> = {
-  // Brand mark — companion-star orbit (matches the app icon): stroked ring with a
-  // filled core and a filled companion dot on the ring. Bolder default strokeWidth below.
+  // Brand mark — 「空盔与一缕在场」. The symmetric dome and pill visor stay
+  // intentionally generic: no ears, fins, or borrowed character silhouette.
   brand: (
     <>
-      <circle cx="12" cy="12" r="7" />
-      <circle cx="12" cy="12" r="1.7" fill="currentColor" stroke="none" />
-      <circle cx="19" cy="12" r="2" fill="currentColor" stroke="none" />
+      <path d="M12 3c-5 0-8 3.6-8 8.4V16a2.5 2.5 0 0 0 2.5 2.5h11A2.5 2.5 0 0 0 20 16v-4.6C20 6.6 17 3 12 3Z" />
+      <rect x="8.2" y="11.1" width="7.6" height="3.2" rx="1.6" fill="currentColor" stroke="none" />
+      <path
+        className="brand-smoke"
+        d="M12 18.5c-.9.7-.9 1.6 0 2.4"
+        strokeWidth="1.5"
+      />
     </>
   ),
   // 助理 — chat bubble
@@ -279,9 +283,15 @@ export interface IconProps {
   size?: number;
   className?: string;
   strokeWidth?: number;
+  /** Brand smoke moves only while work is live; all other icons ignore this. */
+  live?: boolean;
 }
 
-export function Icon({ name, size = 16, className, strokeWidth }: IconProps) {
+export function Icon({ name, size = 16, className, strokeWidth, live = false }: IconProps) {
+  const brandClass =
+    name === "brand"
+      ? `${size <= 16 ? "brand-mark-compact" : "brand-mark-detailed"} ${live ? "brand-mark-live" : "brand-mark-idle"}`
+      : "";
   return (
     <svg
       width={size}
@@ -292,7 +302,7 @@ export function Icon({ name, size = 16, className, strokeWidth }: IconProps) {
       strokeWidth={strokeWidth ?? (name === "brand" ? 2.4 : 1.8)}
       strokeLinecap="round"
       strokeLinejoin="round"
-      className={className}
+      className={[className, brandClass].filter(Boolean).join(" ")}
       aria-hidden="true"
     >
       {PATHS[name]}

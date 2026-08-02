@@ -7,7 +7,7 @@ import { test, AGENT_PROFILES } from "./fixtures";
 
 test("the mission list renders with state filters", async ({ page }) => {
   await page.goto("/#/missions");
-  await expect(page.getByRole("heading", { name: "任务" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Missions" })).toBeVisible();
   await expect(page.getByText("重写设置页", { exact: true })).toBeVisible();
   await expect(page.getByText("整理本周周报", { exact: true })).toBeVisible();
   // Row state badges (scoped to the rows — the filter tabs share the same labels).
@@ -60,12 +60,12 @@ test("confirming the plan queues the mission", async ({ page }) => {
 
 test("creating a mission navigates to its detail page", async ({ page }) => {
   await page.goto("/#/missions");
-  await page.getByRole("button", { name: /新建任务/ }).first().click();
+  await page.getByRole("button", { name: "新建 Mission" }).first().click();
 
-  const drawer = page.getByRole("dialog", { name: "新建任务" });
+  const drawer = page.getByRole("dialog", { name: "新建 Mission" });
   await expect(drawer.locator("#mission-workspace")).toHaveValue("/Users/test/qh-agent");
   await drawer.locator("#mission-goal").fill("做一个 HTML 周报");
-  await drawer.getByRole("button", { name: "创建任务" }).click();
+  await drawer.getByRole("button", { name: "创建 Mission" }).click();
 
   const planning = drawer.getByTestId("mission-planning-stream");
   await expect(planning).toContainText("主 Agent 正在规划");
@@ -136,18 +136,34 @@ const overrideProfiles = (
       }),
   );
 
-test("the create drawer blocks submit when no usable executor exists", async ({ page }) => {
-  await overrideProfiles(page, []);
+test("the create drawer blocks submit when the main Agent is missing", async ({ page }) => {
+  await page.route(
+    (url) => new URL(url).pathname === "/v1/readiness",
+    (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          model_ready: false,
+          workspace: "/Users/test/qh-agent",
+          workspace_valid: true,
+          main_agent: "missing",
+          main_profile: null,
+          can_create_mission: false,
+          next_action: "select_main_agent",
+        }),
+      }),
+  );
   await page.goto("/#/missions");
-  await page.getByRole("button", { name: /新建任务/ }).first().click();
+  await page.getByRole("button", { name: "新建 Mission" }).first().click();
 
-  const drawer = page.getByRole("dialog", { name: "新建任务" });
-  await expect(drawer.getByTestId("executor-missing-notice")).toContainText("执行");
+  const drawer = page.getByRole("dialog", { name: "新建 Mission" });
+  await expect(drawer.getByTestId("mission-readiness-notice")).toContainText("main Agent");
   await drawer.locator("#mission-goal").fill("做一个 HTML 周报");
-  await expect(drawer.getByRole("button", { name: "创建任务" })).toBeDisabled();
+  await expect(drawer.getByRole("button", { name: "创建 Mission" })).toBeDisabled();
 
-  await drawer.getByRole("button", { name: "前往 Agents" }).click();
-  await expect(page).toHaveURL(/#\/agents$/);
+  await drawer.getByRole("button", { name: "前往修复" }).click();
+  await expect(page).toHaveURL(/#\/home$/);
 });
 
 test("confirm is blocked while a seat profile is disabled, with an Agents deep-link", async ({

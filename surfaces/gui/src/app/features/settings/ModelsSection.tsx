@@ -13,6 +13,7 @@ import {
   verifyProvider,
 } from "../../lib/api/settings";
 import type { ProviderField, ProviderInfo } from "../../lib/api/types";
+import { Drawer } from "../../components/Drawer";
 import { Icon } from "../../components/Icon";
 import { openExternal } from "../../../tauri";
 import {
@@ -150,6 +151,7 @@ function ProviderEditor({
                   type="button"
                   role="radio"
                   aria-checked={active}
+                  data-provider-field
                   onClick={() => setFieldValue(f.key, choice.value)}
                   className={
                     "flex items-center gap-1.5 whitespace-nowrap rounded-lg px-3 py-1 text-[12.5px] transition-colors " +
@@ -187,6 +189,7 @@ function ProviderEditor({
         <input
           className={INPUT}
           type={kind === "secret" ? "password" : "text"}
+          data-provider-field
           placeholder={
             kind === "secret" && provider.configured && !dirty
               ? "已保存,输入以替换"
@@ -202,58 +205,12 @@ function ProviderEditor({
   };
 
   return (
-    <>
-      <div className="fixed inset-0 z-30 bg-black/20" onClick={onClose} aria-hidden="true" />
-      <aside
-        className="fixed inset-y-0 right-0 z-40 flex w-[440px] max-w-full flex-col border-l border-line bg-paper shadow-2xl"
-        role="dialog"
-        aria-label={`配置 ${provider.title}`}
-      >
-        <div className="flex items-center justify-between border-b border-line bg-panel px-4 py-3">
-          <div className="flex min-w-0 items-center gap-2">
-            <div className="truncate text-[13.5px] font-semibold tracking-tight">
-              {provider.title}
-            </div>
-            <span className={`${TAG} ${status.tone === "ok" ? "bg-okSoft text-ok" : "bg-solid text-muted"}`}>
-              {status.label}
-            </span>
-            {sourceLabel && (
-              <span className={`${TAG} bg-accentSoft text-accent`}>{sourceLabel}</span>
-            )}
-          </div>
-          <button
-            type="button"
-            onClick={onClose}
-            title="关闭"
-            className="grid h-6 w-6 place-items-center rounded text-faint hover:bg-paper hover:text-ink"
-          >
-            <Icon name="close" size={14} />
-          </button>
-        </div>
-        <div className="hairline-scroll flex-1 overflow-y-auto py-1">
-          {provider.blurb && <p className="px-4 py-2.5 text-[12px] text-muted">{provider.blurb}</p>}
-          <div className="divide-y divide-line">
-            {visibleProviderFields(provider, draft).map(fieldView)}
-          </div>
-          {keyHelp && provider.needs_key && (
-            <p className="px-4 py-2.5 text-[12px] text-faint">
-              还没有密钥?{" "}
-              <button
-                type="button"
-                className="text-accent hover:underline"
-                onClick={() => openExternal(keyHelp.url)}
-              >
-                到 {keyHelp.label} 创建 ↗
-              </button>
-            </p>
-          )}
-          {verify.state === "error" && (
-            <p className="px-4 py-2 text-[12px] text-danger" role="alert">
-              {verify.msg}
-            </p>
-          )}
-          {verify.state === "ok" && <p className="px-4 py-2 text-[12px] text-ok">{verify.msg}</p>}
-        </div>
+    <Drawer
+      title={`配置 ${provider.title}`}
+      dirty={dirty && !removing && verify.state !== "testing"}
+      initialFocus="[data-provider-field]"
+      onClose={onClose}
+      footer={
         <div className="flex items-center justify-between gap-3 border-t border-line bg-panel px-4 py-3">
           {provider.configured ? (
             confirmRemove ? (
@@ -302,8 +259,41 @@ function ProviderEditor({
             </button>
           </div>
         </div>
-      </aside>
-    </>
+      }
+    >
+        <div className="py-1">
+          <div className="flex items-center gap-1.5 px-4 py-2.5">
+            <span className={`${TAG} ${status.tone === "ok" ? "bg-okSoft text-ok" : "bg-solid text-muted"}`}>
+              {status.label}
+            </span>
+            {sourceLabel && (
+              <span className={`${TAG} bg-accentSoft text-accent`}>{sourceLabel}</span>
+            )}
+          </div>
+          {provider.blurb && <p className="px-4 py-2.5 text-[12px] text-muted">{provider.blurb}</p>}
+          <div className="divide-y divide-line">
+            {visibleProviderFields(provider, draft).map(fieldView)}
+          </div>
+          {keyHelp && provider.needs_key && (
+            <p className="px-4 py-2.5 text-[12px] text-faint">
+              还没有密钥?{" "}
+              <button
+                type="button"
+                className="text-accent hover:underline"
+                onClick={() => openExternal(keyHelp.url)}
+              >
+                到 {keyHelp.label} 创建 ↗
+              </button>
+            </p>
+          )}
+          {verify.state === "error" && (
+            <p className="px-4 py-2 text-[12px] text-danger" role="alert">
+              {verify.msg}
+            </p>
+          )}
+          {verify.state === "ok" && <p className="px-4 py-2 text-[12px] text-ok">{verify.msg}</p>}
+        </div>
+    </Drawer>
   );
 }
 

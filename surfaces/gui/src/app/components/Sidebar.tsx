@@ -12,13 +12,10 @@ export interface NavItem {
 }
 
 export const NAV_ITEMS: readonly NavItem[] = [
-  { name: "assistant", label: "助理", icon: "assistant" },
+  { name: "home", label: "首页", icon: "brand" },
+  { name: "missions", label: "Missions", icon: "missions" },
   { name: "agents", label: "Agents", icon: "agents" },
-  { name: "missions", label: "任务", icon: "missions" },
-  { name: "inbox", label: "收件箱", icon: "inbox" },
-  { name: "automations", label: "自动化", icon: "automations" },
-  { name: "integrations", label: "集成", icon: "integrations" },
-  { name: "settings", label: "设置", icon: "settings" },
+  { name: "inbox", label: "审批", icon: "inbox" },
 ];
 
 export interface SidebarProps {

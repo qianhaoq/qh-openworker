@@ -5,6 +5,7 @@
 
 import { useMemo, useState, type ReactNode } from "react";
 import type { Automation } from "../../lib/api/types";
+import { Drawer } from "../../components/Drawer";
 import { Icon } from "../../components/Icon";
 import { Switch } from "../../components/Switch";
 import {
@@ -92,6 +93,7 @@ export function AutomationEditor({
     [draft.cron, isOnce],
   );
   const cronPreview = useMemo(() => humanizeCron(draft.cron), [draft.cron]);
+  const dirty = JSON.stringify(draft) !== JSON.stringify(initial);
 
   const flash = (result: ActionResult, okText: string): boolean => {
     if (result.ok) {
@@ -139,39 +141,72 @@ export function AutomationEditor({
   };
 
   return (
-    <>
-      <div className="fixed inset-0 z-30 bg-black/20" onClick={onClose} aria-hidden="true" />
-      <aside
-        className="fixed inset-y-0 right-0 z-40 flex w-[440px] max-w-full flex-col border-l border-line bg-paper shadow-2xl"
-        role="dialog"
-        aria-label={isNew ? "新建自动化" : `编辑 ${original.title}`}
-      >
-        {/* header */}
-        <div className="flex items-center justify-between border-b border-line bg-panel px-4 py-3">
-          <div className="flex items-center gap-2.5">
-            <span className="grid h-7 w-7 place-items-center rounded-lg bg-accentSoft text-accent">
-              <Icon name="automations" size={14} />
-            </span>
-            <div className="text-[13.5px] font-semibold tracking-tight">
-              {isNew ? "新建自动化" : original.title}
-            </div>
+    <Drawer
+      title={isNew ? "新建自动化" : `编辑 ${original.title}`}
+      dirty={dirty && !busy}
+      initialFocus="#automation-title"
+      onClose={onClose}
+      icon={
+        <span className="grid h-7 w-7 place-items-center rounded-lg bg-accentSoft text-accent">
+          <Icon name="automations" size={14} />
+        </span>
+      }
+      footer={
+        <div className="border-t border-line bg-panel px-4 py-3">
+          <div className="mb-2 text-[11px] leading-relaxed text-faint">
+            仅在 openworker-server 运行时触发；错过的计划会在下次启动时补跑一次。
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            title="关闭"
-            className="grid h-6 w-6 place-items-center rounded text-faint hover:bg-paper hover:text-ink"
-          >
-            <Icon name="close" size={14} />
-          </button>
+          <div className="flex items-center gap-2">
+            {!isNew &&
+              (confirmingDelete ? (
+                <span className="flex items-center gap-1.5">
+                  <button type="button" className={BTN_DANGER} disabled={busy} onClick={() => void remove()}>
+                    确认删除
+                  </button>
+                  <button type="button" className={BTN} onClick={() => setConfirmingDelete(false)}>
+                    取消
+                  </button>
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  className={BTN_DANGER}
+                  disabled={busy}
+                  onClick={() => setConfirmingDelete(true)}
+                >
+                  删除
+                </button>
+              ))}
+            <span className="flex-1" />
+            {!isNew && (
+              <button
+                type="button"
+                className={BTN}
+                disabled={busy}
+                title="立即运行一次（打开实时会话）"
+                onClick={() => void runNow()}
+              >
+                立即运行
+              </button>
+            )}
+            <button
+              type="button"
+              className={BTN_ACCENT}
+              disabled={busy || !!cronError}
+              onClick={() => void save()}
+            >
+              {isNew ? "创建" : "保存"}
+            </button>
+          </div>
         </div>
-
-        {/* body */}
-        <div className="hairline-scroll flex-1 overflow-y-auto px-4 pb-4">
-          <div className={GRP_H}>基本信息</div>
-          <div className={`${GRP} divide-y divide-line`}>
-            <Field label="名称">
+      }
+    >
+      <div className="px-4 pb-4">
+        <div className={GRP_H}>基本信息</div>
+        <div className={`${GRP} divide-y divide-line`}>
+          <Field label="名称">
               <input
+                id="automation-title"
                 className={FIELD}
                 value={draft.title}
                 onChange={(e) => setDraft({ ...draft, title: e.target.value })}
@@ -266,56 +301,6 @@ export function AutomationEditor({
           )}
           {notice && <p className="mt-3 text-[12px] text-ok">{notice}</p>}
         </div>
-
-        {/* footer */}
-        <div className="border-t border-line bg-panel px-4 py-3">
-          <div className="mb-2 text-[11px] leading-relaxed text-faint">
-            仅在 openworker-server 运行时触发；错过的计划会在下次启动时补跑一次。
-          </div>
-          <div className="flex items-center gap-2">
-            {!isNew &&
-              (confirmingDelete ? (
-                <span className="flex items-center gap-1.5">
-                  <button type="button" className={BTN_DANGER} disabled={busy} onClick={() => void remove()}>
-                    确认删除
-                  </button>
-                  <button type="button" className={BTN} onClick={() => setConfirmingDelete(false)}>
-                    取消
-                  </button>
-                </span>
-              ) : (
-                <button
-                  type="button"
-                  className={BTN_DANGER}
-                  disabled={busy}
-                  onClick={() => setConfirmingDelete(true)}
-                >
-                  删除
-                </button>
-              ))}
-            <span className="flex-1" />
-            {!isNew && (
-              <button
-                type="button"
-                className={BTN}
-                disabled={busy}
-                title="立即运行一次（打开实时会话）"
-                onClick={() => void runNow()}
-              >
-                立即运行
-              </button>
-            )}
-            <button
-              type="button"
-              className={BTN_ACCENT}
-              disabled={busy || !!cronError}
-              onClick={() => void save()}
-            >
-              {isNew ? "创建" : "保存"}
-            </button>
-          </div>
-        </div>
-      </aside>
-    </>
+    </Drawer>
   );
 }

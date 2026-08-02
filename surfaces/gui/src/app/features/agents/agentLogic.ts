@@ -48,8 +48,8 @@ export const ROLE_META: Record<AgentRole, RoleMeta> = {
   },
   reviewer: {
     label: "审查",
-    tint: "bg-warnSoft text-warnInk",
-    tagTint: "bg-warnSoft text-warnInk",
+    tint: "bg-reviewSoft text-reviewInk",
+    tagTint: "bg-reviewSoft text-reviewInk",
     description: "只读审查 diff、测试与风险",
   },
   gui: {

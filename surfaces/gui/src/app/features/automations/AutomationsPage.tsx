@@ -256,7 +256,7 @@ export function AutomationsPage() {
     drawer?.kind === "edit" ? automations.find((a) => a.id === drawer.id) ?? null : null;
 
   return (
-    <div data-tauri-drag-region className="mx-auto max-w-3xl px-8 py-8">
+    <div className="mx-auto max-w-3xl px-8 py-8">
       <header data-tauri-drag-region className="flex items-start justify-between gap-4">
         <div>
           <h1 className="text-[22px] font-semibold tracking-tight">自动化</h1>

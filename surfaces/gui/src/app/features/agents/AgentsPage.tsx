@@ -5,6 +5,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { detectAgentCommands } from "../../lib/api/agents";
 import type { AgentProfile } from "../../lib/api/types";
+import { Drawer } from "../../components/Drawer";
 import { Icon } from "../../components/Icon";
 import { Switch } from "../../components/Switch";
 import { AgentEditor } from "./AgentEditor";
@@ -180,8 +181,8 @@ export function AgentsPage() {
     busyIds,
     refresh,
     save,
-    probe,
     setEnabled,
+    activate,
     remove,
     setMain,
   } = useAgentProfiles();
@@ -191,11 +192,16 @@ export function AgentsPage() {
   // open, covering each preset's command word; informational only (never blocks 招募).
   const [detected, setDetected] = useState<Record<string, boolean> | null>(null);
 
+  const detectablePresets = useMemo(
+    () => AGENT_PRESETS.filter((preset) => preset.command !== "npx" && preset.key !== "custom"),
+    [],
+  );
+
   useEffect(() => {
-    if (drawer?.kind !== "presets") return;
+    if (drawer?.kind !== "presets" && profiles.length > 0) return;
     let stale = false;
     setDetected(null);
-    const commands = [...new Set(AGENT_PRESETS.map(presetCommandName))];
+    const commands = [...new Set(detectablePresets.map(presetCommandName))];
     detectAgentCommands(commands)
       .then((data) => {
         if (!stale) setDetected(data.results ?? {});
@@ -206,7 +212,7 @@ export function AgentsPage() {
     return () => {
       stale = true;
     };
-  }, [drawer?.kind]);
+  }, [detectablePresets, drawer?.kind, profiles.length]);
 
   const existingIds = useMemo(() => new Set(profiles.map((profile) => profile.id)), [profiles]);
 
@@ -224,7 +230,7 @@ export function AgentsPage() {
     drawer?.kind === "edit" ? profiles.find((profile) => profile.id === drawer.profileId) ?? null : null;
 
   return (
-    <div data-tauri-drag-region className="mx-auto max-w-3xl px-8 py-8">
+    <div className="mx-auto max-w-3xl px-8 py-8">
       <header data-tauri-drag-region className="flex items-start justify-between gap-4">
         <div>
           <h1 className="text-[22px] font-semibold tracking-tight">Agents</h1>
@@ -239,7 +245,7 @@ export function AgentsPage() {
             className="flex shrink-0 items-center gap-1.5 rounded-lg bg-accent px-3.5 py-1.5 text-[13px] font-medium text-white hover:brightness-105"
           >
             <Icon name="plus" size={14} />
-            招募 Agent
+            添加 Agent
           </button>
         )}
       </header>
@@ -269,26 +275,38 @@ export function AgentsPage() {
           </button>
         </div>
       ) : profiles.length === 0 ? (
-        /* 空状态:招募第一个 agent,直达预设 */
+        /* 真空态:只展示本机直接检测到的 runtime。 */
         <div className="flex flex-col items-center py-16 text-center">
           <div className="grid h-11 w-11 place-items-center rounded-xl2 bg-accentSoft text-accent">
             <Icon name="agents" size={20} />
           </div>
-          <h2 className="mt-4 text-[15px] font-semibold tracking-tight">招募你的第一个本地 agent</h2>
+          <h2 className="mt-4 text-[15px] font-semibold tracking-tight">还没有 Agent</h2>
           <p className="mt-1.5 max-w-sm text-[13px] leading-relaxed text-muted">
-            Agent profile 描述一个可启动的本地 runtime。保存后先探测能力,再启用。
+            这里只显示本机 PATH 能直接启动的 runtime。执行和审查角色会在 Mission 需要时再引导。
           </p>
-          <div className="mt-6 grid w-full max-w-md grid-cols-2 gap-2.5 text-left">
-            {AGENT_PRESETS.map((preset) => (
-              <PresetCard key={preset.key} preset={preset} onPick={() => pickPreset(preset)} />
-            ))}
-          </div>
+          {detected === null ? (
+            <div className="mt-6 flex items-center gap-2 text-[13px] text-faint">
+              <span className="spinner" /> 检测本机 runtime
+            </div>
+          ) : detectablePresets.some((preset) => detected[presetCommandName(preset)] === true) ? (
+            <div className="mt-6 grid w-full max-w-md grid-cols-2 gap-2.5 text-left">
+              {detectablePresets
+                .filter((preset) => detected[presetCommandName(preset)] === true)
+                .map((preset) => (
+                  <PresetCard key={preset.key} preset={preset} installed onPick={() => pickPreset(preset)} />
+                ))}
+            </div>
+          ) : (
+            <p className="mt-5 max-w-sm text-[12.5px] leading-relaxed text-faint">
+              未检测到 Kimi、Gemini、OpenCode 或 Pi。你仍可手动填写本地 runtime 命令。
+            </p>
+          )}
           <button
             type="button"
             onClick={pickBlank}
             className="mt-4 text-[13px] text-accent hover:underline"
           >
-            或从空白自定义开始
+            手动添加
           </button>
         </div>
       ) : (
@@ -316,35 +334,25 @@ export function AgentsPage() {
 
       {/* 预设选择 drawer */}
       {drawer?.kind === "presets" && (
-        <>
-          <div className="fixed inset-0 z-30 bg-black/20" onClick={() => setDrawer(null)} aria-hidden="true" />
-          <aside
-            className="fixed inset-y-0 right-0 z-40 flex w-[440px] max-w-full flex-col border-l border-line bg-paper shadow-2xl"
-            role="dialog"
-            aria-label="招募 Agent"
-          >
-            <div className="flex items-center justify-between border-b border-line bg-panel px-4 py-3">
-              <div className="text-[13.5px] font-semibold tracking-tight">招募 Agent</div>
-              <button
-                type="button"
-                onClick={() => setDrawer(null)}
-                title="关闭"
-                className="grid h-6 w-6 place-items-center rounded text-faint hover:bg-paper hover:text-ink"
-              >
-                <Icon name="close" size={14} />
-              </button>
-            </div>
-            <div className="hairline-scroll flex-1 overflow-y-auto p-4">
+        <Drawer title="添加 Agent" onClose={() => setDrawer(null)}>
+            <div className="p-4">
               <div className="grid grid-cols-2 gap-2.5">
-                {AGENT_PRESETS.map((preset) => (
-                  <PresetCard
-                    key={preset.key}
-                    preset={preset}
-                    installed={detected?.[presetCommandName(preset)]}
-                    onPick={() => pickPreset(preset)}
-                  />
-                ))}
+                {detectablePresets
+                  .filter((preset) => detected?.[presetCommandName(preset)] === true)
+                  .map((preset) => (
+                    <PresetCard
+                      key={preset.key}
+                      preset={preset}
+                      installed
+                      onPick={() => pickPreset(preset)}
+                    />
+                  ))}
               </div>
+              {detected !== null && !detectablePresets.some((preset) => detected[presetCommandName(preset)] === true) && (
+                <p className="text-[12.5px] leading-relaxed text-faint">
+                  未检测到可直接启动的 runtime。不会用 npx 推断未安装的包。
+                </p>
+              )}
               <button
                 type="button"
                 onClick={pickBlank}
@@ -361,8 +369,7 @@ export function AgentsPage() {
                 </span>
               </button>
             </div>
-          </aside>
-        </>
+        </Drawer>
       )}
 
       {/* 新建 / 编辑 drawer */}
@@ -378,7 +385,7 @@ export function AgentsPage() {
           probeError={probeErrors[drawer.draft.id]}
           busy={busyIds.has(drawer.draft.id)}
           onSave={save}
-          onProbe={probe}
+          onActivate={activate}
           onSetEnabled={setEnabled}
           onSetMain={setMain}
           onDelete={remove}
@@ -398,7 +405,7 @@ export function AgentsPage() {
           probeError={probeErrors[editProfile.id]}
           busy={busyIds.has(editProfile.id)}
           onSave={save}
-          onProbe={probe}
+          onActivate={activate}
           onSetEnabled={setEnabled}
           onSetMain={setMain}
           onDelete={remove}
